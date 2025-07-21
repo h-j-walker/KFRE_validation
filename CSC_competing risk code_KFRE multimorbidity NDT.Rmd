@@ -1,0 +1,3694 @@
+---
+title: "UKB KFRE multimorbidity code_NDT github_ Adapted from: External validation of the performance of competing risks prediction models: a guide through modern methods -  Cause specific hazard models"
+always_allow_html: true
+output:
+  github_document:
+    toc: true
+    toc_depth: 5
+  keep_text: true
+  pandoc_args: --webtex
+---
+  
+## Steps
+  
+The steps taken in this file are:   
+1. To develop a competing risks prediction model using the cause specific hazards approach.
+2. To assess the performance of the model in terms of calibration, discrimination and overall prediction error. We calculate the apparent (no internal validation) validation and the external validation.
+3. To assess the potential clinical utility the model using decision curve analysis.
+
+### Installing and loading packages and import data
+
+The following libraries are used in this file, the code chunk below will a) check whether you already have them installed, b) install them for you if not already present, and c) load the packages into the session.
+
+```{r setup, include=FALSE}
+# Knitr options
+knitr::opts_chunk$set(
+  fig.retina = 3,
+  fig.path = "imgs/Prediction_CSC/",
+  echo = FALSE
+)
+```
+
+```{r, wdlib, message=FALSE, warning=FALSE, echo=TRUE}
+# Use pacman to check whether packages are installed, if not load
+if (!require("pacman")) install.packages("pacman")
+library(pacman)
+
+pacman::p_load(
+  survival,
+  rms,
+  cmprsk,
+  riskRegression,
+  mstate,
+  pseudo,
+  pec,
+  riskRegression,
+  plotrix,
+  knitr,
+  splines,
+  kableExtra,
+  gtsummary,
+  boot,
+  tidyverse,
+  rsample,
+  gridExtra,
+  webshot,
+  dplyr,
+  tidymodels
+)
+
+# Import data ------------------
+load(file="~/R working directory/SCREAM/linear_predictor.RData")
+rdata <- linear_predictor
+vdata <- readRDS("~/R working directory/UKB/new_ukb.rds")
+
+rdata$event <- ifelse(rdata$death==1, 2, 0)
+rdata$event <- ifelse(rdata$outcome==1, 1, rdata$event)
+rdata = rdata %>% 
+  mutate(time = (futime_months/12)) %>% 
+  mutate(status= case_when(
+    event==2 ~ "death",
+    event==1 ~"KF",
+    event==0 ~ "cens")) %>% 
+  mutate(acr2 = ifelse(acr2 == 0, 0.00001, acr2)) %>% 
+  mutate(lnacr2 = (log(acr2)))
+
+vdata$event <- ifelse(vdata$death==1, 2, 0)
+vdata$event <- ifelse(vdata$outcome==1, 1, vdata$event)
+vdata = vdata %>% 
+  mutate(time = (futime_months/12)) %>% 
+  mutate(status= case_when(
+    event==2 ~ "death",
+    event==1 ~"KF",
+    event==0 ~ "cens")) %>% 
+  mutate(acr2 = ifelse(acr2 == 0, 0.00001, acr2)) %>% 
+  mutate(lnacr2 = (log(acr2)))
+
+rdata <- rdata %>%
+  mutate(status = factor(case_when(
+    event == 2 ~ "death",
+    event == 1 ~ "KF",
+    event == 0 ~ "cens"
+  ), levels = c("death", "KF", "cens")))
+
+vdata <- vdata %>%
+  mutate(status = factor(case_when(
+    event == 2 ~ "death",
+    event == 1 ~ "KF",
+    event == 0 ~ "cens"
+  ), levels = c("death", "KF", "cens")))
+
+rdata <- rdata %>%
+  mutate(sex = factor(case_when(
+    female == 0 ~ "female",
+    female == 1 ~ "male"
+  ), levels = c("female", "male")))
+
+
+vdata <- vdata %>%
+  mutate(sex = factor(case_when(
+    sexnumber == 0 ~ "female",
+    sexnumber == 1 ~ "male"
+  ), levels = c("female", "male")))
+
+rdata <- rdata %>% 
+  rename_at('lopnr', ~'eid') %>% 
+  rename_at('sex', ~'sexnumber')
+vdata <- vdata %>% 
+  select(-sexnumber) %>% 
+  rename_at('sex', ~'sexnumber')
+
+rdata_mm <- subset(rdata, rdata$mmcount_nockd >1)
+rdata_nomm <- subset(rdata, rdata$mmcount_nockd<=1)
+vdata_mm <- subset(vdata, vdata$mmcount_nockd >1)
+vdata_nomm <- subset(vdata, vdata$mmcount_nockd<=1)
+```
+
+
+
+### Descriptive statistics
+
+```{r, import}
+rsel <- rdata[, c("eid", "age", "sexnumber", "egfrcr09_race_allnonblack", "lnacr2", "acr2")]
+vsel <- vdata[, c("eid", "age", "sexnumber", "egfrcr09_race_allnonblack", "lnacr2", "acr2")]
+
+
+rsel_mm <- rdata_mm[, c("eid", "age", "sexnumber", "egfrcr09_race_allnonblack", "lnacr2", "acr2")]
+vsel_mm <- vdata_mm[, c("eid", "age", "sexnumber", "egfrcr09_race_allnonblack", "lnacr2", "acr2")]
+
+rsel_nomm <- rdata_nomm[, c("eid", "age", "sexnumber", "egfrcr09_race_allnonblack", "lnacr2", "acr2")]
+vsel_nomm <- vdata_nomm[, c("eid", "age", "sexnumber", "egfrcr09_race_allnonblack", "lnacr2", "acr2")]
+
+rsel$dt <- 1
+vsel$dt <- 2
+cdata <- rbind(rsel, vsel)
+cdata$dt <- factor(
+  cdata$dt,
+  levels = c(1, 2),
+  labels = c("Development data", "Validation data")
+)
+label(cdata$age) <- "Age"
+label(cdata$sexnumber) <- "Sex"
+label(cdata$egfrcr09_race_allnonblack) <- "eGFR creatinine"
+label(cdata$acr2) <- "uACR"
+units(cdata$age) <- "years"
+units(cdata$egfrcr09_race_allnonblack) <- "ml/min/1.73m2"
+units(cdata$acr2) <- "mg/mmol"
+```
+
+
+```{r tab1_bis}
+gtsummary::tbl_summary(
+  data = cdata |> select(-eid),
+  label = list(age ~ "Age (years)", egfrcr09_race_allnonblack ~ "eGFR creatinine (ml/min/1.73m2)", acr2 ~"uACR (mg/mmol)"),
+  by = "dt",
+  type = all_continuous() ~ "continuous2",
+  statistic = all_continuous() ~ c(
+    "{mean} ({sd})",
+    "{median} ({min}, {max})"
+  ),
+) |>
+  gtsummary::as_kable_extra() |>
+  kableExtra::kable_styling("striped")
+```
+
+## Goal 1 - develop a competing risks prediction model
+
+### 1.1 Cumulative incidence curves
+
+First, we draw the cumulative incidence curves of kidney failure.
+
+<details>
+  <summary>Click to expand code</summary>
+```{r, cuminc, fig.align='center', eval=FALSE, echo=TRUE}
+
+rdata <- rdata %>% 
+  select("eid", "status", "time", "age", "sexnumber", "egfrcr09_race_allnonblack", "lnacr2", "event", "acr2")
+
+rdata <- rdata %>%
+  mutate(time = if_else(time <=0, 0.1, time))
+
+rdata <- as.data.frame(rdata)
+
+
+
+
+# Expand data to prepare for fitting the model
+rdata.w <- crprep(
+  Tstop = "time",
+  status = "event",
+  trans = c(1, 2),
+  id = "eid",
+  keep = c("age", "sexnumber", "egfrcr09_race_allnonblack", "lnacr2"),
+  data = rdata
+)
+# Save extended data with weights for KF (failcode=1)
+# and mortality (failcode=2)
+rdata.w1 <- rdata.w |> filter(failcode == 1)
+rdata.w2 <- rdata.w |> filter(failcode == 2)
+
+vdata <- vdata %>% 
+  select("eid", "status", "time", "age", "sexnumber", "egfrcr09_race_allnonblack", "lnacr2", "event") %>% 
+  mutate(time)
+
+vdata <- vdata %>%
+  mutate(time = if_else(time <=0, 0.1, time))
+
+vdata <- as.data.frame(vdata)
+
+vdata.w <- crprep(
+  Tstop = "time",
+  status = "event",
+  trans = c(1, 2),
+  id = "eid",
+  keep = c("age", "sexnumber", "egfrcr09_race_allnonblack", "lnacr2"),
+  data = vdata
+)
+vdata.w1 <- vdata.w |> filter(failcode == 1)
+vdata.w2 <- vdata.w |> filter(failcode == 2)
+
+# Development set 
+
+mfit_rdata <- survfit(
+  Surv(Tstart, Tstop, status == 1) ~ 1,
+  data = rdata.w1, 
+  weights = weight.cens
+)
+
+mfit_vdata <- survfit(
+  Surv(Tstart, Tstop, status == 1) ~ 1,
+  data = vdata.w1, 
+  weights = weight.cens
+)
+
+par(xaxs = "i", yaxs = "i", las = 1)
+oldpar <- par(mfrow = c(1, 2), mar = c(5, 5, 1, 1))
+plot(
+  mfit_rdata,
+  col = 1, lwd = 2,
+  xlab = "Time (years)",
+  ylab = "Cumulative incidence kdiney failure", bty = "n",
+  ylim = c(0, 0.05), 
+  xlim = c(0, 5), 
+  fun = "event", 
+  conf.int = TRUE
+)
+title("Development data")
+plot(
+  mfit_vdata,
+  col = 1, lwd = 2,
+  xlab = "Time (years)",
+  ylab = "Cumulative incidence kidney failure", bty = "n",
+  ylim = c(0, 0.05), 
+  xlim = c(0, 5), 
+  fun = "event",
+  conf.int = TRUE
+)
+title("Validation data")
+par(oldpar)
+
+# Cumulative incidences for kidney failure
+smfit_rdata <- summary(mfit_rdata, times = c(1, 2, 3, 4, 5))
+smfit_vdata <- summary(mfit_vdata, times = c(1, 2, 3, 4, 5))
+
+###Death
+
+# Development set 
+mfit_rdata2 <- survfit(
+  Surv(Tstart, Tstop, status == 2) ~ 1,
+  data = rdata.w2, 
+  weights = weight.cens
+)
+mfit_vdata2 <- survfit(
+  Surv(Tstart, Tstop, status == 2) ~ 1,
+  data = vdata.w2, 
+  weights = weight.cens
+)
+par(xaxs = "i", yaxs = "i", las = 1)
+oldpar <- par(mfrow = c(1, 2), mar = c(5, 5, 1, 1))
+plot(
+  mfit_rdata2,
+  col = 1, lwd = 2,
+  xlab = "Time (years)",
+  ylab = "Cumulative incidence death", bty = "n",
+  ylim = c(0, 0.50), 
+  xlim = c(0, 5), 
+  fun = "event", 
+  conf.int = TRUE
+)
+title("Development data")
+plot(
+  mfit_vdata2,
+  col = 1, lwd = 2,
+  xlab = "Time (years)",
+  ylab = "Cumulative incidence death", bty = "n",
+  ylim = c(0, 0.50), 
+  xlim = c(0, 5), 
+  fun = "event",
+  conf.int = TRUE
+)
+title("Validation data")
+par(oldpar)
+
+# Cumulative incidences for death
+smfit_rdata2 <- summary(mfit_rdata2, times = c(1, 2, 3, 4, 5))
+smfit_vdata2 <- summary(mfit_vdata2, times = c(1, 2, 3, 4, 5))
+```
+
+```{r, cuminc, fig.align='center', eval=FALSE, echo=TRUE}
+#Multimorbidity vs no multimorbidity
+
+rdata_mm <- rdata_mm %>% 
+  select("eid", "status", "time", "age", "sexnumber", "egfrcr09_race_allnonblack", "lnacr2", "event", "acr2")
+
+rdata_mm <- rdata_mm %>%
+  mutate(time = if_else(time <=0, 0.1, time))
+
+rdata_mm <- as.data.frame(rdata_mm)
+
+rdata_nomm <- rdata_nomm %>% 
+  select("eid", "status", "time", "age", "sexnumber", "egfrcr09_race_allnonblack", "lnacr2", "event", "acr2")
+
+rdata_nomm <- rdata_nomm %>%
+  mutate(time = if_else(time <=0, 0.1, time))
+
+rdata_nomm <- as.data.frame(rdata_nomm)
+
+
+# Expand data to prepare for fitting the model
+rdata_mm.w <- crprep(
+  Tstop = "time",
+  status = "event",
+  trans = c(1, 2),
+  id = "eid",
+  keep = c("age", "sexnumber", "egfrcr09_race_allnonblack", "lnacr2"),
+  data = rdata_mm
+)
+rdata_nomm.w <- crprep(
+  Tstop = "time",
+  status = "event",
+  trans = c(1, 2),
+  id = "eid",
+  keep = c("age", "sexnumber", "egfrcr09_race_allnonblack", "lnacr2"),
+  data = rdata_nomm
+)
+# Save extended data with weights for KF (failcode=1)
+# and mortality (failcode=2)
+rdata_mm.w1 <- rdata_mm.w |> filter(failcode == 1)
+rdata_mm.w2 <- rdata_mm.w |> filter(failcode == 2)
+
+rdata_nomm.w1 <- rdata_nomm.w |> filter(failcode == 1)
+rdata_nomm.w2 <- rdata_nomm.w |> filter(failcode == 2)
+
+vdata_mm <- vdata_mm %>% 
+  select("eid", "status", "time", "age", "sexnumber", "egfrcr09_race_allnonblack", "lnacr2", "event") %>% 
+  mutate(time)
+
+vdata_mm <- vdata_mm %>%
+  mutate(time = if_else(time <=0, 0.1, time))
+
+vdata_mm <- as.data.frame(vdata_mm)
+
+vdata_mm.w <- crprep(
+  Tstop = "time",
+  status = "event",
+  trans = c(1, 2),
+  id = "eid",
+  keep = c("age", "sexnumber", "egfrcr09_race_allnonblack", "lnacr2"),
+  data = vdata_mm
+)
+vdata_mm.w1 <- vdata_mm.w |> filter(failcode == 1)
+vdata_mm.w2 <- vdata_mm.w |> filter(failcode == 2)
+
+vdata_nomm <- vdata_nomm %>% 
+  select("eid", "status", "time", "age", "sexnumber", "egfrcr09_race_allnonblack", "lnacr2", "event") %>% 
+  mutate(time)
+
+vdata_nomm <- vdata_nomm %>%
+  mutate(time = if_else(time <=0, 0.1, time))
+
+vdata_nomm <- as.data.frame(vdata_nomm)
+
+vdata_nomm.w <- crprep(
+  Tstop = "time",
+  status = "event",
+  trans = c(1, 2),
+  id = "eid",
+  keep = c("age", "sexnumber", "egfrcr09_race_allnonblack", "lnacr2"),
+  data = vdata_nomm
+)
+vdata_nomm.w1 <- vdata_nomm.w |> filter(failcode == 1)
+vdata_nomm.w2 <- vdata_nomm.w |> filter(failcode == 2)
+
+# Development set 
+
+mfit_rdata_mm <- survfit(
+  Surv(Tstart, Tstop, status == 1) ~ 1,
+  data = rdata_mm.w1, 
+  weights = weight.cens
+)
+mfit_rdata_nomm <- survfit(
+  Surv(Tstart, Tstop, status == 1) ~ 1,
+  data = rdata_nomm.w1, 
+  weights = weight.cens
+)
+
+
+mfit_vdata_mm <- survfit(
+  Surv(Tstart, Tstop, status == 1) ~ 1,
+  data = vdata_mm.w1, 
+  weights = weight.cens
+)
+
+mfit_vdata_nomm <- survfit(
+  Surv(Tstart, Tstop, status == 1) ~ 1,
+  data = vdata_nomm.w1, 
+  weights = weight.cens
+)
+
+
+par(xaxs = "i", yaxs = "i", las = 1)
+oldpar <- par(mfrow = c(1, 2), mar = c(5, 5, 1, 1))
+
+plot(
+  mfit_rdata_mm,
+  col = 1, lwd = 2,
+  xlab = "Time (years)",
+  ylab = "Cumulative incidence kidney failure", bty = "n",
+  ylim = c(0, 0.05), 
+  xlim = c(0, 5), 
+  fun = "event",
+  conf.int = TRUE
+)
+title("SCREAM multimorbidity cohort")
+plot(
+  mfit_rdata_nomm,
+  col = 1, lwd = 2,
+  xlab = "Time (years)",
+  ylab = "Cumulative incidence kidney failure", bty = "n",
+  ylim = c(0, 0.05), 
+  xlim = c(0, 5), 
+  fun = "event",
+  conf.int = TRUE
+)
+title("SCREAM no multimorbidity cohort")
+
+plot(
+  mfit_vdata_mm,
+  col = 1, lwd = 2,
+  xlab = "Time (years)",
+  ylab = "Cumulative incidence kidney failure", bty = "n",
+  ylim = c(0, 0.05), 
+  xlim = c(0, 5), 
+  fun = "event",
+  conf.int = TRUE
+)
+title("UK Biobank multimorbidity cohort")
+plot(
+  mfit_vdata_nomm,
+  col = 1, lwd = 2,
+  xlab = "Time (years)",
+  ylab = "Cumulative incidence kidney failure", bty = "n",
+  ylim = c(0, 0.05), 
+  xlim = c(0, 5), 
+  fun = "event",
+  conf.int = TRUE
+)
+title("UK Biobank no multimorbidity cohort")
+par(oldpar)
+
+# Cumulative incidences for kidney failure
+smfit_rdata_mm <- summary(mfit_rdata_mm, times = c(1, 2, 3, 4, 5))
+smfit_vdata_mm <- summary(mfit_vdata_mm, times = c(1, 2, 3, 4, 5))
+smfit_rdata_nomm <- summary(mfit_rdata_nomm, times = c(1, 2, 3, 4, 5))
+smfit_vdata_nomm <- summary(mfit_vdata_nomm, times = c(1, 2, 3, 4, 5))
+
+###Death
+
+# Development set 
+mfit_rdata_mm2 <- survfit(
+  Surv(Tstart, Tstop, status == 2) ~ 1,
+  data = rdata_mm.w2, 
+  weights = weight.cens
+)
+mfit_vdata_mm2 <- survfit(
+  Surv(Tstart, Tstop, status == 2) ~ 1,
+  data = vdata_mm.w2, 
+  weights = weight.cens
+)
+
+mfit_rdata_nomm2 <- survfit(
+  Surv(Tstart, Tstop, status == 2) ~ 1,
+  data = rdata_nomm.w2, 
+  weights = weight.cens
+)
+mfit_vdata_nomm2 <- survfit(
+  Surv(Tstart, Tstop, status == 2) ~ 1,
+  data = vdata_nomm.w2, 
+  weights = weight.cens
+)
+
+par(xaxs = "i", yaxs = "i", las = 1)
+oldpar <- par(mfrow = c(1, 2), mar = c(5, 5, 1, 1))
+plot(
+  mfit_rdata_mm2,
+  col = 1, lwd = 2,
+  xlab = "Time (years)",
+  ylab = "Cumulative incidence death", bty = "n",
+  ylim = c(0, 0.50), 
+  xlim = c(0, 5), 
+  fun = "event", 
+  conf.int = TRUE
+)
+title("SCREAM multimorbidity cohort")
+plot(
+  mfit_vdata_mm2,
+  col = 1, lwd = 2,
+  xlab = "Time (years)",
+  ylab = "Cumulative incidence death", bty = "n",
+  ylim = c(0, 0.50), 
+  xlim = c(0, 5), 
+  fun = "event",
+  conf.int = TRUE
+)
+title("UK Biobank multimorbidity cohort")
+plot(
+  mfit_rdata_nomm2,
+  col = 1, lwd = 2,
+  xlab = "Time (years)",
+  ylab = "Cumulative incidence death", bty = "n",
+  ylim = c(0, 0.50), 
+  xlim = c(0, 5), 
+  fun = "event", 
+  conf.int = TRUE
+)
+title("SCREAM no multimorbidity cohort")
+plot(
+  mfit_vdata_nomm2,
+  col = 1, lwd = 2,
+  xlab = "Time (years)",
+  ylab = "Cumulative incidence death", bty = "n",
+  ylim = c(0, 0.50), 
+  xlim = c(0, 5), 
+  fun = "event",
+  conf.int = TRUE
+)
+title("UK Biobank no multimorbidity cohort")
+par(oldpar)
+
+# Cumulative incidences for death
+smfit_rdata_mm2 <- summary(mfit_rdata_mm2, times = c(1, 2, 3, 4, 5))
+smfit_vdata_mm2 <- summary(mfit_vdata_mm2, times = c(1, 2, 3, 4, 5))
+smfit_rdata_nomm2 <- summary(mfit_rdata_nomm2, times = c(1, 2, 3, 4, 5))
+smfit_vdata_nomm2 <- summary(mfit_vdata_nomm2, times = c(1, 2, 3, 4, 5))
+```
+
+</details>
+
+```{r, cuminc, fig.align='center', eval=TRUE}
+```
+
+The R packages and functions `cmprsk::cuminc()` and `mstate::Cuminc()`are good and easy alternatives to estimate the cumulative incidence function. 
+
+```{r, res_ci, fig.align='center'}
+res_ci <- cbind(
+  1 - smfit_rdata$surv,
+  1 - smfit_rdata$upper,
+  1 - smfit_rdata$lower,
+  1 - smfit_vdata$surv,
+  1 - smfit_vdata$upper,
+  1 - smfit_vdata$lower
+)
+
+res_ci <- round(res_ci, 4)
+rownames(res_ci) <- c("1-year", "2-year", "3-year", "4-year", "5-year")
+colnames(res_ci) <- rep(c("Estimate", "Lower .95", "Upper .95"), 2)
+kable(res_ci, row.names = TRUE) |>
+  kable_styling("striped", position = "center") |>
+  add_header_above(c(" " = 1, "Development data" = 3, "Validation data" = 3))|>
+  add_header_above(c("Cumulative incidence of kidney failure" = 7))
+
+res_ci2 <- cbind(
+  1 - smfit_rdata2$surv,
+  1 - smfit_rdata2$upper,
+  1 - smfit_rdata2$lower,
+  1 - smfit_vdata2$surv,
+  1 - smfit_vdata2$upper,
+  1 - smfit_vdata2$lower
+)
+res_ci2 <- round(res_ci2, 4)
+rownames(res_ci2) <- c("1-year", "2-year", "3-year", "4-year", "5-year")
+colnames(res_ci2) <- rep(c("Estimate", "Lower .95", "Upper .95"), 2)
+kable(res_ci2, row.names = TRUE) |>
+  kable_styling("striped", position = "center") |>
+  add_header_above(c(" " = 1, "Development data" = 3, "Validation data" = 3))|>
+  add_header_above(c("Cumulative incidence of death" = 7))
+```
+
+The 5-year cumulative incidence of kidney failure was 3.13% (95% CI: 2.95-3.32%) in the SCREAM cohort, and 1.27% (95% CI: 1.13-1.41%) in the UK Biobank cohort.
+The 5-year cumulative incidence of death was 27.01% (95% CI: 26.53-27.48%) in the SCREAM cohort, and 5.67% (95% CI: 5.38-5.96%) in the UK Biobank cohort.
+
+```{r, res_ci, fig.align='center'}
+##Multimorbidity cohorts
+res_ci <- cbind(
+  1 - smfit_rdata_mm$surv,
+  1 - smfit_rdata_mm$upper,
+  1 - smfit_rdata_mm$lower,
+  1 - smfit_vdata_mm$surv,
+  1 - smfit_vdata_mm$upper,
+  1 - smfit_vdata_mm$lower
+)
+res_ci <- round(res_ci, 4)
+rownames(res_ci) <- c("1-year", "2-year", "3-year", "4-year", "5-year")
+colnames(res_ci) <- rep(c("Estimate", "Lower .95", "Upper .95"), 2)
+kable(res_ci, row.names = TRUE) |>
+  kable_styling("striped", position = "center") |>
+  add_header_above(c(" " = 1, "SCREAM multimorbidity cohort" = 3, "UK Biobank multimorbidity cohort" = 3))|>
+  add_header_above(c("Cumulative incidence of kidney failure" = 7))
+
+res_ci2 <- cbind(
+  1 - smfit_rdata_mm2$surv,
+  1 - smfit_rdata_mm2$upper,
+  1 - smfit_rdata_mm2$lower,
+  1 - smfit_vdata_mm2$surv,
+  1 - smfit_vdata_mm2$upper,
+  1 - smfit_vdata_mm2$lower
+)
+res_ci2 <- round(res_ci2, 4)
+rownames(res_ci2) <- c("1-year", "2-year", "3-year", "4-year", "5-year")
+colnames(res_ci2) <- rep(c("Estimate", "Lower .95", "Upper .95"), 2)
+kable(res_ci2, row.names = TRUE) |>
+  kable_styling("striped", position = "center") |>
+  add_header_above(c(" " = 1, "SCREAM multimorbidity cohort" = 3, "UK Biobank multimorbidity cohort" = 3))|>
+  add_header_above(c("Cumulative incidence of death" = 7))
+```
+The 5-year cumulative incidence of kidney failure was 2.95% (95% CI: 2.74-3.16%) in the SCREAM multimorbidity cohort, and 1.22% (95% CI: 1.06-1.39%) in the UK Biobank multimorbidity cohort.
+The 5-year cumulative incidence of death was 34.0% (95% CI: 33.39-34.60%) in the SCREAM multimorbidity cohort, and 5.61% (95% CI: 5.27-5.95%) in the UK Biobank multimorbidity cohort.
+
+```{r, res_ci, fig.align='center'}
+##Multimorbidity cohorts
+res_ci <- cbind(
+  1 - smfit_rdata_nomm$surv,
+  1 - smfit_rdata_nomm$upper,
+  1 - smfit_rdata_nomm$lower,
+  1 - smfit_vdata_nomm$surv,
+  1 - smfit_vdata_nomm$upper,
+  1 - smfit_vdata_nomm$lower
+)
+res_ci <- round(res_ci, 4)
+rownames(res_ci) <- c("1-year", "2-year", "3-year", "4-year", "5-year")
+colnames(res_ci) <- rep(c("Estimate", "Lower .95", "Upper .95"), 2)
+kable(res_ci, row.names = TRUE) |>
+  kable_styling("striped", position = "center") |>
+  add_header_above(c(" " = 1, "SCREAM no multimorbidity cohort" = 3, "UK Biobank no multimorbidity cohort" = 3))|>
+  add_header_above(c("Cumulative incidence of kidney failure" = 7))
+
+res_ci2 <- cbind(
+  1 - smfit_rdata_nomm2$surv,
+  1 - smfit_rdata_nomm2$upper,
+  1 - smfit_rdata_nomm2$lower,
+  1 - smfit_vdata_nomm2$surv,
+  1 - smfit_vdata_nomm2$upper,
+  1 - smfit_vdata_nomm2$lower
+)
+res_ci2 <- round(res_ci2, 4)
+rownames(res_ci2) <- c("1-year", "2-year", "3-year", "4-year", "5-year")
+colnames(res_ci2) <- rep(c("Estimate", "Lower .95", "Upper .95"), 2)
+kable(res_ci2, row.names = TRUE) |>
+  kable_styling("striped", position = "center") |>
+  add_header_above(c(" " = 1, "SCREAM no multimorbidity cohort" = 3, "UK Biobank no multimorbidity cohort" = 3))|>
+  add_header_above(c("Cumulative incidence of death" = 7))
+```
+The 5-year cumulative incidence of kidney failure was 3.56% (95% CI: 3.20-3.91%) in the SCREAM no multimorbidity cohort, and 0.74% (95% CI: 0.57-0.91%) in the UK Biobank no multimorbidity cohort.
+The 5-year cumulative incidence of death was 11.11% (95% CI: 10.50-11.71%) in the SCREAM no multimorbidity cohort, and 3.34% (95% CI: 2.98-3.70%) in the UK Biobank no multimorbidity cohort.
+
+### 1.2 Check non-linearity of continuous predictors
+
+Here we investigate the potential non-linear relation between continuous predictors (i.e. age, eGFR, uACR) and the outcomes. We apply three-knot restricted cubic splines using `rms::rcs()` function (details are given in e.g. Frank Harrell's book 'Regression Model Strategies (second edition)', page 27. We assess the potential non-linearity graphically (plotting the two continuous predictors against the log relative hazards (XB or linear predictor) of both event types. Also, we compare the models with and without splines based on the AIC using `stats::AIC()`.
+
+<details>
+  <summary>Click to expand code</summary>
+```{r,ff, warning=FALSE, fig.align='center', eval=FALSE, echo=TRUE}
+# Models without splines
+fit_csh <- CSC(
+  Hist(time, event) ~ age + sexnumber + egfrcr09_race_allnonblack + lnacr2,
+  data = rdata,
+  fitter = "cph"
+)
+
+fit_csc1 <- fit_csh$models$`Cause 1`
+fit_csc2 <- fit_csh$models$`Cause 2`
+
+# Models with splines
+dd <- datadist(rdata)
+options(datadist = "dd")
+
+# Kidney failure
+fit_csc1_rcs <- cph(
+  Surv(time, event == 1) ~ rcs(age, 3) + rcs(egfrcr09_race_allnonblack, 3) + rcs(lnacr2, 3) + sexnumber,
+  x = T,
+  y = T,
+  surv = T,
+  data = rdata
+)
+print(fit_csc1_rcs)
+print(summary(fit_csc1_rcs))
+print(anova(fit_csc1_rcs))
+P_csc1_age_rcs <- Predict(fit_csc1_rcs, "age")
+P_csc1_egfrcr_rcs <- Predict(fit_csc1_rcs, "egfrcr09_race_allnonblack")
+P_csc1_acr_rcs <- Predict(fit_csc1_rcs, "lnacr2")
+options(datadist = NULL)
+# Mortality
+dd <- datadist(rdata)
+options(datadist = "dd")
+fit_csc2_rcs <- cph(
+  Surv(time, event == 2) ~ rcs(age, 3) + rcs(egfrcr09_race_allnonblack, 3) + rcs(lnacr2, 3) + sexnumber,
+  x = T,
+  y = T,
+  surv = T,
+  data = rdata
+)
+ print(fit_csc2_rcs)
+ print(summary(fit_csc2_rcs))
+ print(anova(fit_csc2_rcs))
+P_csc2_age_rcs <- Predict(fit_csc2_rcs, "age")
+P_csc2_egfrcr_rcs <- Predict(fit_csc2_rcs, "egfrcr09_race_allnonblack")
+P_csc2_acr_rcs <- Predict(fit_csc1_rcs, "lnacr2")
+options(datadist = NULL)
+oldpar <- par(mfrow = c(2, 2), mar = c(5, 5, 1, 1))
+par(xaxs = "i", yaxs = "i", las = 1)
+plot(
+  P_csc1_age_rcs$age,
+  P_csc1_age_rcs$yhat,
+  type = "l",
+  lwd = 2,
+  col = "blue",
+  bty = "n",
+  xlab = "Age years",
+  ylab = "log Relative Hazard",
+  ylim = c(-3, 3),
+  xlim = c(18, 99)
+)
+polygon(
+  c(P_csc1_age_rcs$age, rev(P_csc1_age_rcs$age)),
+  c(P_csc1_age_rcs$lower, rev(P_csc1_age_rcs$upper)),
+  col = "grey75",
+  border = FALSE
+)
+par(new = TRUE)
+plot(
+  P_csc1_age_rcs$age,
+  P_csc1_age_rcs$yhat,
+  type = "l",
+  lwd = 2,
+  col = "blue",
+  bty = "n",
+  xlab = "Age years",
+  ylab = "log Relative Hazard",
+  ylim = c(-3, 3),
+  xlim = c(18, 99)
+)
+title("Kidney failure")
+# CSC 1- egfr
+par(xaxs = "i", yaxs = "i", las = 1)
+plot(
+  P_csc1_egfrcr_rcs$egfrcr09_race_allnonblack,
+  P_csc1_egfrcr_rcs$yhat,
+  type = "l",
+  lwd = 2,
+  col = "blue",
+  bty = "n",
+  xlab = "eGFR creatinine",
+  ylab = "log Relative Hazard",
+  ylim = c(-3, 3),
+  xlim = c(10, 60)
+)
+polygon(
+  c(P_csc1_egfrcr_rcs$egfrcr09_race_allnonblack, rev(P_csc1_egfrcr_rcs$egfrcr09_race_allnonblack)),
+  c(P_csc1_egfrcr_rcs$lower, rev(P_csc1_egfrcr_rcs$upper)),
+  col = "grey75",
+  border = FALSE
+)
+par(new = TRUE)
+plot(
+  P_csc1_egfrcr_rcs$egfrcr09_race_allnonblack,
+  P_csc1_egfrcr_rcs$yhat,
+  type = "l",
+  lwd = 2,
+  col = "blue",
+  bty = "n",
+  xlab = "eGFR creatinine",
+  ylab = "log Relative Hazard",
+  ylim = c(-3, 3),
+  xlim = c(10, 60)
+)
+title("Kidney failure")
+par(xaxs = "i", yaxs = "i", las = 1)
+options(datadist = NULL)
+# CSC 2- age
+plot(
+  P_csc2_age_rcs$age,
+  P_csc2_age_rcs$yhat,
+  type = "l",
+  lwd = 2,
+  col = "blue",
+  bty = "n",
+  xlab = "Age years",
+  ylab = "log Relative Hazard",
+  ylim = c(-3, 3),
+  xlim = c(18, 99)
+)
+polygon(
+  c(P_csc2_age_rcs$age, rev(P_csc2_age_rcs$age)),
+  c(P_csc2_age_rcs$lower, rev(P_csc2_age_rcs$upper)),
+  col = "grey75",
+  border = FALSE
+)
+par(new = TRUE)
+plot(
+  P_csc2_age_rcs$age,
+  P_csc2_age_rcs$yhat,
+  type = "l",
+  lwd = 2,
+  col = "blue",
+  bty = "n",
+  xlab = "Age years",
+  ylab = "log Relative Hazard",
+  ylim = c(-3, 3),
+  xlim = c(18, 99)
+)
+title("Mortality")
+# CSC 2 - egfrcr09_race_allnonblack
+par(xaxs = "i", yaxs = "i", las = 1)
+plot(
+  P_csc2_egfrcr_rcs$egfrcr09_race_allnonblack,
+  P_csc2_egfrcr_rcs$yhat,
+  type = "l",
+  lwd = 2,
+  col = "blue",
+  bty = "n",
+  xlab = "eGFR creatinine",
+  ylab = "log Relative Hazard",
+  ylim = c(-3, 3),
+  xlim = c(10, 60)
+)
+polygon(
+  c(P_csc2_egfrcr_rcs$egfrcr09_race_allnonblack, rev(P_csc2_egfrcr_rcs$egfrcr09_race_allnonblack)),
+  c(P_csc2_egfrcr_rcs$lower, rev(P_csc2_egfrcr_rcs$upper)),
+  col = "grey75",
+  border = FALSE
+)
+par(new = TRUE)
+plot(
+  P_csc2_egfrcr_rcs$egfrcr09_race_allnonblack,
+  P_csc2_egfrcr_rcs$yhat,
+  type = "l",
+  lwd = 2,
+  col = "blue",
+  bty = "n",
+  xlab = "eGFR creatinine",
+  ylab = "log Relative Hazard",
+  ylim = c(-3, 3),
+  xlim = c(10, 60)
+)
+title("Mortality")
+options(datadist = NULL)
+par(oldpar)
+
+# CSC 2- acr2
+plot(
+  P_csc1_acr_rcs$lnacr2,
+  P_csc1_acr_rcs$yhat,
+  type = "l",
+  lwd = 2,
+  col = "blue",
+  bty = "n",
+  xlab = "uACR mg/mmol",
+  ylab = "log Relative Hazard",
+  ylim = c(-3, 3),
+  xlim = c(-12, 7)
+)
+polygon(
+  c(P_csc1_acr_rcs$lnacr2, rev(P_csc1_acr_rcs$lnacr2)),
+  c(P_csc1_acr_rcs$lower, rev(P_csc1_acr_rcs$upper)),
+  col = "grey75",
+  border = FALSE
+)
+par(new = TRUE)
+plot(
+  P_csc1_acr_rcs$lnacr2,
+  P_csc1_acr_rcs$yhat,
+  type = "l",
+  lwd = 2,
+  col = "blue",
+  bty = "n",
+  xlab = "uACR mg/mmol",
+  ylab = "log Relative Hazard",
+  ylim = c(-3, 3),
+  xlim = c(-12, 7)
+)
+title("Kidney failure")
+# CSC 2 - acr2
+par(xaxs = "i", yaxs = "i", las = 1)
+plot(
+  P_csc2_acr_rcs$lnacr2,
+  P_csc2_acr_rcs$yhat,
+  type = "l",
+  lwd = 2,
+  col = "blue",
+  bty = "n",
+  xlab = "uACR mg/mmol",
+  ylab = "log Relative Hazard",
+  ylim = c(-3, 3),
+  xlim = c(-12, 7)
+)
+polygon(
+  c(P_csc2_acr_rcs$lnacr2, rev(P_csc2_acr_rcs$lnacr2)),
+  c(P_csc2_acr_rcs$lower, rev(P_csc2_acr_rcs$upper)),
+  col = "grey75",
+  border = FALSE
+)
+par(new = TRUE)
+plot(
+  P_csc2_acr_rcs$lnacr2,
+  P_csc2_acr_rcs$yhat,
+  type = "l",
+  lwd = 2,
+  col = "blue",
+  bty = "n",
+  xlab = "uACR mg/mmol",
+  ylab = "log Relative Hazard",
+  ylim = c(-3, 3),
+  xlim = c(-12, 7)
+)
+title("Mortality")
+options(datadist = NULL)
+par(oldpar)
+```
+</details>
+
+```{r,ff, warning=FALSE, fig.align='center', eval=TRUE}
+```
+
+```{r, res_aic, fig.align='center'}
+res_AIC <- matrix(c(
+  AIC(fit_csc1), AIC(fit_csc1_rcs),
+  AIC(fit_csc2), AIC(fit_csc2_rcs)
+),
+byrow = T,
+ncol = 2,
+nrow = 2,
+dimnames =
+  list(
+    c(
+      "Kidney failure specific hazard",
+      "Mortality"
+    ),
+    c(
+      "AIC without splines",
+      "AIC with splines"
+    )
+  )
+)
+kable(res_AIC, row.names = TRUE) |>
+  kable_styling("striped", position = "center")
+```
+
+### 1.3 Checking proportional hazards assumption
+
+We now examine the fits further by checking the proportionality of the cause-specific hazards.
+
+<details>
+  <summary>Click to expand code</summary>
+```{r,ph_csc1, message=FALSE, warning=FALSE,fig.align='center', echo=TRUE, eval=FALSE}
+zp_csc1 <- cox.zph(fit_csc1, transform = "identity")
+par(las = 1, xaxs = "i", yaxs = "i")
+# c(bottom, left, top, right)
+oldpar <- par(mfrow = c(2, 2), mar = c(5, 6.1, 3.1, 1))
+sub_title <- c("Age", "Sex", "eGFR creatinine", "uACR")
+for (i in 1:4) {
+  plot(
+    zp_csc1[i],
+    resid = F,
+    bty = "n",
+    xlim = c(0, 5)
+  )
+  abline(0, 0, lty = 3)
+  title(sub_title[i])
+}
+mtext("Kidney Failure", side = 3, line = -1, outer = TRUE, font = 2)
+par(oldpar)
+kable(round(zp_csc1$table, 3)) |>
+  kable_styling("striped", position = "center")
+```
+</details>
+
+```{r,ph_csc1, message=FALSE, warning=FALSE,fig.align='center', echo=FALSE, eval=TRUE}
+```
+
+<details>
+  <summary>Click to expand code</summary>
+```{r,ph_csc2, message=FALSE, warning=FALSE,fig.align='center',echo=TRUE,eval=FALSE}
+zp_csc2 <- cox.zph(fit_csc2, transform = "identity")
+par(las = 1, xaxs = "i", yaxs = "i")
+# c(bottom, left, top, right)
+oldpar <- par(mfrow = c(2, 2), mar = c(5, 6.1, 3.1, 1))
+sub_title <- c("Age", "Sex", "eGFR creatinine", "uACR")
+for (i in 1:4) {
+  plot(
+    zp_csc2[i],
+    resid = F,
+    bty = "n",
+    xlim = c(0, 5)
+  )
+  abline(0, 0, lty = 3)
+  title(sub_title[i])
+}
+mtext(
+  "Mortality",
+  side = 3,
+  line = -1,
+  outer = TRUE,
+  font = 2
+)
+par(oldpar)
+kable(round(zp_csc2$table, 3)) |>
+  kable_styling("striped", position = "center")
+```
+</details>
+
+```{r,ph_csc2, message=FALSE, warning=FALSE,fig.align='center',echo=FALSE,eval=TRUE}
+```
+
+### 1.4 Examine the fit of the models
+
++ Cox proportional hazard model for kidney failure
+
+```{r, summary_csc1, fig.align='center',warning=FALSE}
+dd <- datadist(rdata)
+options(datadist = "dd")
+options(prType = "html")
+fit_csc1_cph <- cph(
+  Surv(time, event == 1) ~ age + sexnumber + egfrcr09_race_allnonblack + lnacr2,
+  x = T,
+  y = T,
+  surv = T,
+  data = rdata
+)
+print(fit_csc1_cph)
+# print(summary(fit_csc1_cph))
+options(datadist = NULL)
+```
+
++ Cox proportional hazard model for mortality
+
+```{r, summary_csc2, fig.align='center',warning=FALSE}
+dd <- datadist(rdata)
+options(datadist = "dd")
+options(prType = "html")
+fit_csc2_cph <- cph(
+  Surv(time, event == 2) ~ age + sexnumber + egfrcr09_race_allnonblack + lnacr2,
+  x = T,
+  y = T,
+  surv = T,
+  data = rdata
+)
+print(fit_csc2_cph)
+# print(summary(fit_csc2_cph))
+options(datadist = NULL)
+```
+### 1.5 Plot of predictors vs estimated risk at 5 years in the validation data
+
+<details>
+  <summary>Click to expand code</summary>
+```{r, plot_risk, fig.align='center',warning=FALSE, echo=TRUE, eval=FALSE}
+# Models -------------
+fit_csh <- CSC(
+  formula = Hist(time, event) ~ age + sexnumber + egfrcr09_race_allnonblack + lnacr2,
+  data = rdata
+)
+
+# External validation at 5 years
+horizon <- 5
+
+# Calculate predicted probabilities
+vdata$pred <- predictRisk(
+  fit_csh,
+  cause = 1,
+  newdata = vdata,
+  times = horizon
+)
+
+###SCREAM mm vs nomm
+rdata_mm$pred <- predictRisk(
+  fit_csh,
+  cause = 1,
+  newdata = rdata_mm,
+  times = horizon
+)
+
+rdata_nomm$pred <- predictRisk(
+  fit_csh,
+  cause = 1,
+  newdata = rdata_nomm,
+  times = horizon
+)
+
+###UKB mm vs nomm
+
+vdata_mm$pred <- predictRisk(
+  fit_csh,
+  cause = 1,
+  newdata = vdata_mm,
+  times = horizon
+)
+
+vdata_nomm$pred <- predictRisk(
+  fit_csh,
+  cause = 1,
+  newdata = vdata_nomm,
+  times = horizon
+)
+
+
+# Age
+oldpar <- par(mfrow = c(2, 2))
+par(xaxs = "i", yaxs = "i", las = 1)
+plot(vdata$age,
+  vdata$pred,
+  bty = "n",
+  xlim = c(18, 99),
+  ylim = c(0, 1),
+  xlab = "Age, years",
+  ylab = "Estimated risk"
+)
+lines(
+  lowess(vdata$age, vdata$pred),
+  col = "red",
+  lwd = 2
+)
+
+# eGFR
+par(xaxs = "i", yaxs = "i", las = 1)
+plot(
+  vdata$egfrcr09_race_allnonblack,
+  vdata$pred,
+  bty = "n",
+  xlim = c(10, 60),
+  ylim = c(0, 1),
+  xlab = "eGFR creatinine",
+  ylab = "Estimated risk"
+)
+lines(
+  lowess(vdata$egfrcr09_race_allnonblack, vdata$pred),
+  col = "red",
+  lwd = 2
+)
+
+# uACR
+par(xaxs = "i", yaxs = "i", las = 1)
+plot(
+  vdata$lnacr2,
+  vdata$pred,
+  xlim = c(0, 2150),
+  ylim = c(0, 1),
+  bty = "n",
+  xlab = "uACR mg/mmol",
+  ylab = "Estimated risk"
+)
+lines(
+  lowess(vdata$lnacr2, vdata$pred),
+  col = "red",
+  lwd = 2
+)
+
+# Sex
+par(xaxs = "i", yaxs = "i", las = 1)
+plot(
+  vdata$sexnumber,
+  vdata$pred,
+  ylim = c(0, 1),
+  bty = "n",
+  xlab = "Sex (male)",
+  ylab = "Estimated risk"
+)
+par(oldpar)
+```
+</details>
+
+```{r, plot_risk, fig.align='center',warning=FALSE, echo=FALSE, eval=TRUE}
+```
+
+## Goal 2 - Assessing performance of a competing risks prediction model
+
+Here we evaluate the performance of the prediction model in terms of calibration, discrimination and overall prediction error. 
+
+
+### 2.1 Calibration
+
+We assess calibration by:
+
+- The calibration plot as a graphical representation of calibration using
+ the pseudo observations and the subdistribution hazard approach
+ - Numerical summaries of calibration:  
+ - The observed vs expected ratio (O/E ratio) ;  
+ - The squared bias, i.e., the average squared difference between primary event indicators and risk predictions;
+ - The integrated Calibration Index (ICI), i.e., the average absolute difference between primary event indicators and risk predictions;  
+ - E50, E90 and Emax denote the median, 90th percentile and the maximum of the absolute differences between primary event indicators and risk predictions;  
+ - Calibration intercept/slope estimated using pseudo observations:  
+ - If on average the risk estimates equal the primary event indicators, the calibration intercept will be zero. A negative calibration intercept indicates that the risk estimates are on average too high and a positive intercept indicates that the risk estimates are on average too low.   
+ - A calibration slope between 0 and 1 indicates overfitting of the model, i.e., too extreme predictions, both on the low and on the high         end. A calibration slope >1 indicates predictions do not show enough variation.  
+      
+#### 2.1.1 Calibration using pseudo observations
+
+We calculate calibration plot and numerical summaries of calibration as
+ICI, E50, E90, Emax and root squared bias using pseudo value approach.
+
+##### 2.1.1.1 Calibration plot using pseudo observations
+
+<details>
+  <summary>Click to expand code</summary>
+```{r, cal, fig.align='center',warning=FALSE,message=FALSE,eval=FALSE,echo=TRUE, fig.width=10, fig.height=6}
+# Models ----------
+fit_csh <- CSC(Hist(time, event) ~
+age + sexnumber + egfrcr09_race_allnonblack + lnacr2,
+data = rdata,
+fitter = "cph"
+)
+
+
+# useful objects
+primary_event <- 1 # Set to 2 if cause 2 was of interest
+horizon <- 5 # Set time horizon for prediction (here 5 years)
+
+
+# Predicted risk estimation
+pred <- predictRisk(fit_csh,
+  cause = primary_event,
+  times = horizon,
+  newdata = vdata
+)
+pred_SCREAM_mm <- predictRisk(fit_csh,
+  cause = primary_event,
+  times = horizon,
+  newdata = rdata_mm
+)
+pred_SCREAM_nomm <- predictRisk(fit_csh,
+  cause = primary_event,
+  times = horizon,
+  newdata = rdata_nomm
+)
+pred_UKB_mm <- predictRisk(fit_csh,
+  cause = primary_event,
+  times = horizon,
+  newdata = vdata_mm
+)
+pred_UKB_nomm <- predictRisk(fit_csh,
+  cause = primary_event,
+  times = horizon,
+  newdata = vdata_nomm
+)
+
+
+# Calibration plot (pseudo-obs approach) ----------------------------------
+# First compute riskRegression::Score()
+non_na_indices <- which(!is.na(vdata$pred))
+vdata <- vdata %>%
+  filter(!is.nan(pred))
+non_na_indices <- which(!is.na(vdata$pred))
+vdata <- vdata %>%
+  filter(!is.nan(pred))
+
+score_vdata <- Score(
+  list("csh_validation" = fit_csh),
+  formula = Hist(time, event) ~ 1,
+  cens.model = "km",
+  data = vdata,
+  conf.int = TRUE,
+  times = horizon,
+  #  metrics = c("auc", "brier"),
+  summary = c("ipa"),
+  cause = primary_event,
+  plots = "calibration"
+)
+
+calplot_pseudo <- plotCalibration(
+  x = score_vdata,
+  brier.in.legend = FALSE,
+  auc.in.legend = FALSE,
+  cens.method = "pseudo",
+  bandwidth = 0.05, # leave as NULL for default choice of smoothing
+  cex = 1,
+  round = FALSE, # Important, keeps all unique risk estimates rather than rounding
+  xlim = c(0, 1.0),
+  ylim = c(0, 1.0),
+  rug = TRUE,
+  xlab = "Predictions",
+  bty = "n"
+)
+title("Calibration plot using pseudo observations")
+
+score_rdata_mm <- Score(
+  list("csh_validation_mm" = fit_csh),
+  formula = Hist(time, event) ~ 1,
+  cens.model = "km",
+  data = rdata_mm,
+  conf.int = TRUE,
+  times = horizon,
+  #  metrics = c("auc", "brier"),
+  summary = c("ipa"),
+  cause = primary_event,
+  plots = "calibration"
+)
+
+calplot_pseudo_SCREAM_mm <- plotCalibration(
+  x = score_rdata_mm,
+  brier.in.legend = FALSE,
+  auc.in.legend = FALSE,
+  cens.method = "pseudo",
+  bandwidth = 0.05, # leave as NULL for default choice of smoothing
+  cex = 1,
+  round = FALSE, # Important, keeps all unique risk estimates rather than rounding
+  xlim = c(0, 1.0),
+  ylim = c(0, 1.0),
+  rug = TRUE,
+  xlab = "Predictions",
+  bty = "n"
+)
+title("Calibration plot using pseudo observations - SCREAM multimorbidity cohort")
+
+score_rdata_nomm <- Score(
+  list("csh_validation_nomm" = fit_csh),
+  formula = Hist(time, event) ~ 1,
+  cens.model = "km",
+  data = rdata_nomm,
+  conf.int = TRUE,
+  times = horizon,
+  #  metrics = c("auc", "brier"),
+  summary = c("ipa"),
+  cause = primary_event,
+  plots = "calibration"
+)
+
+calplot_pseudo_SCREAM_nomm <- plotCalibration(
+  x = score_rdata_nomm,
+  brier.in.legend = FALSE,
+  auc.in.legend = FALSE,
+  cens.method = "pseudo",
+  bandwidth = 0.05, # leave as NULL for default choice of smoothing
+  cex = 1,
+  round = FALSE, # Important, keeps all unique risk estimates rather than rounding
+  xlim = c(0, 1.0),
+  ylim = c(0, 1.0),
+  rug = TRUE,
+  xlab = "Predictions",
+  bty = "n"
+)
+title("Calibration plot using pseudo observations - SCREAM no multimorbidity cohort")
+
+
+
+
+score_vdata_mm <- Score(
+  list("csh_validation_UKB_mm" = fit_csh),
+  formula = Hist(time, event) ~ 1,
+  cens.model = "km",
+  data = vdata_mm,
+  conf.int = TRUE,
+  times = horizon,
+  #  metrics = c("auc", "brier"),
+  summary = c("ipa"),
+  cause = primary_event,
+  plots = "calibration"
+)
+
+calplot_pseudo_UKB_mm <- plotCalibration(
+  x = score_vdata_mm,
+  brier.in.legend = FALSE,
+  auc.in.legend = FALSE,
+  cens.method = "pseudo",
+  bandwidth = 0.05, # leave as NULL for default choice of smoothing
+  cex = 1,
+  round = FALSE, # Important, keeps all unique risk estimates rather than rounding
+  xlim = c(0, 1.0),
+  ylim = c(0, 1.0),
+  rug = TRUE,
+  xlab = "Predictions",
+  bty = "n"
+)
+title("Calibration plot using pseudo observations - UK Biobank multimorbidity cohort")
+
+score_vdata_nomm <- Score(
+  list("csh_validation_UKB_nomm" = fit_csh),
+  formula = Hist(time, event) ~ 1,
+  cens.model = "km",
+  data = vdata_nomm,
+  conf.int = TRUE,
+  times = horizon,
+  #  metrics = c("auc", "brier"),
+  summary = c("ipa"),
+  cause = primary_event,
+  plots = "calibration"
+)
+
+calplot_pseudo_UKB_nomm <- plotCalibration(
+  x = score_vdata_nomm,
+  brier.in.legend = FALSE,
+  auc.in.legend = FALSE,
+  cens.method = "pseudo",
+  bandwidth = 0.05, # leave as NULL for default choice of smoothing
+  cex = 1,
+  round = FALSE, # Important, keeps all unique risk estimates rather than rounding
+  xlim = c(0, 1.0),
+  ylim = c(0, 1.0),
+  rug = TRUE,
+  xlab = "Predictions",
+  bty = "n"
+)
+title("Calibration plot using pseudo observations - UK Biobank no multimorbidity cohort")
+```
+</details>
+
+```{r, cal, fig.align='center',warning=FALSE,message=FALSE,eval=TRUE,echo=FALSE, fig.width=15, fig.height=6}
+```
+
+
+##### 2.1.1.2 Numerical summaries of calibration using pseudo observations
+
+<details>
+  <summary>Click to expand code</summary>
+```{r, num_cal_pseudo, fig.align='center',warning=FALSE,message=FALSE,echo=TRUE,eval=TRUE}
+
+# We can extract predicted and observed, observed will depend on degree of smoothing (bandwidth)
+dat_pseudo <- calplot_pseudo$plotFrames$csh_validation
+dat_pseudo_SCREAM_mm <-calplot_pseudo_SCREAM_mm$plotFrames$csh_validation_mm
+dat_pseudo_SCREAM_nomm <-calplot_pseudo_SCREAM_nomm$plotFrames$csh_validation_nomm
+dat_pseudo_UKB_mm <-calplot_pseudo_UKB_mm$plotFrames$csh_validation_UKB_mm
+dat_pseudo_UKB_nomm <-calplot_pseudo_UKB_nomm$plotFrames$csh_validation_UKB_nomm
+#
+
+######Does not work if you don't remove missing values earlier in code
+# Calculate difference between predicted and observed (make sure to use all estimated risks, not just unique ones)
+diff_pseudo <- pred - dat_pseudo$Obs[match(pred, dat_pseudo$Pred)]
+diff_pseudo_SCREAM_mm <- pred_SCREAM_mm - dat_pseudo_SCREAM_mm$Obs[match(pred_SCREAM_mm, dat_pseudo_SCREAM_mm$Pred)]
+diff_pseudo_SCREAM_nomm <- pred_SCREAM_nomm - dat_pseudo_SCREAM_nomm$Obs[match(pred_SCREAM_nomm, dat_pseudo_SCREAM_nomm$Pred)]
+diff_pseudo_UKB_mm <- pred_UKB_mm - dat_pseudo_UKB_mm$Obs[match(pred_UKB_mm, dat_pseudo_UKB_mm$Pred)]
+diff_pseudo_UKB_nomm <- pred_UKB_nomm - dat_pseudo_UKB_nomm$Obs[match(pred_UKB_nomm, dat_pseudo_UKB_nomm$Pred)]
+
+
+# Collect all numerical summary measures
+
+numsum_pseudo <- c(
+  "ICI" = mean(abs(diff_pseudo)),
+  setNames(quantile(abs(diff_pseudo), c(0.5, 0.9)), c("E50", "E90")),
+  "Emax" = max(abs(diff_pseudo)),
+  "Root squared bias" = sqrt(mean(diff_pseudo^2))
+)
+
+
+numsum_pseudo <- data.frame(
+  Measure = c("ICI", "E50", "E90", "Emax", "Root squared bias"),
+  Pseudo = c(mean(abs(diff_pseudo)),
+             quantile(abs(diff_pseudo), c(0.5)),
+             quantile(abs(diff_pseudo), c(0.9)),
+             max(abs(diff_pseudo)),
+             sqrt(mean(diff_pseudo^2))),
+  SCREAM_mm = c(mean(abs(diff_pseudo_SCREAM_mm)),
+                quantile(abs(diff_pseudo_SCREAM_mm), c(0.5)),
+                quantile(abs(diff_pseudo_SCREAM_mm), c(0.9)),
+                max(abs(diff_pseudo_SCREAM_mm)),
+                sqrt(mean(diff_pseudo_SCREAM_mm^2))),
+  SCREAM_nomm = c(mean(abs(diff_pseudo_SCREAM_nomm)),
+                  quantile(abs(diff_pseudo_SCREAM_nomm), c(0.5)),
+                  quantile(abs(diff_pseudo_SCREAM_nomm), c(0.9)),
+                  max(abs(diff_pseudo_SCREAM_nomm)),
+                  sqrt(mean(diff_pseudo_SCREAM_nomm^2))),
+  UKB_mm = c(mean(abs(diff_pseudo_UKB_mm)),
+             quantile(abs(diff_pseudo_UKB_mm), c(0.5)),
+             quantile(abs(diff_pseudo_UKB_mm), c(0.9)),
+             max(abs(diff_pseudo_UKB_mm)),
+             sqrt(mean(diff_pseudo_UKB_mm^2))),
+  UKB_nomm = c(mean(abs(diff_pseudo_UKB_nomm)),
+               quantile(abs(diff_pseudo_UKB_nomm), c(0.5)),
+               quantile(abs(diff_pseudo_UKB_nomm), c(0.9)),
+               max(abs(diff_pseudo_UKB_nomm)),
+               sqrt(mean(diff_pseudo_UKB_nomm^2)))
+)
+```
+</details>
+
+
+```{r, res_cal_pseudo, fig.align='center',warning=FALSE,message=FALSE,echo=FALSE}
+# rootmeansquared, E50, E90, Emax, int, slope,
+k <- 4
+res_num <- rbind(
+  "Calibration measures - pseudo observations" = numsum_pseudo
+)
+
+
+kable(res_num) |>
+  kable_styling("striped", position = "center")
+```
+
+#### 2.1.2 Calibration using the subdistribution hazard approach
+Here we assess calibration using the subdistribution hazard approach (Austin et al.)
+
+##### 2.1.2.1 Calibration plot using the subdistribution hazard approach
+
+<details>
+  <summary>Click to expand code</summary>
+```{r, plot_sd, fig.align='center',warning=FALSE,message=FALSE,eval=FALSE,echo=TRUE, fig.width=10, fig.height=5}
+# Models ----------
+fit_csh <- CSC(Hist(time, event) ~
+age + sexnumber + egfrcr09_race_allnonblack + lnacr2,
+data = rdata,
+fitter = "cph"
+)
+
+
+# useful objects
+primary_event <- 1 # Set to 2 if cause 2 was of interest
+horizon <- 5 # Set time horizon for prediction (here 5 years)
+
+
+# Calibration plot (flexible regression approach) -------------------------
+
+# Add estimated risk and complementary log-log of it to dataset
+vdata$pred <- predictRisk(fit_csh,
+  cause = primary_event,
+  newdata = vdata,
+  times = horizon
+)
+
+vdata$cll_pred <- log(-log(1 - pred))
+
+# 5 knots seems to give somewhat equivalent graph to pseudo method with bw = 0.05
+n_internal_knots <- 5 # Austin et al. advise to use between 3 (more smoothing, less flexible) and 5 (less smoothing, more flexible)
+rcs_vdata <- ns(vdata$cll_pred, df = n_internal_knots + 1)
+
+colnames(rcs_vdata) <- paste0("basisf_", colnames(rcs_vdata))
+
+vdata_bis <- cbind.data.frame(vdata, rcs_vdata)
+
+# Use subdistribution hazards (Fine-Gray) model
+form_fgr <- reformulate(
+  termlabels = colnames(rcs_vdata),
+  response = "Hist(time, event)"
+)
+
+# Regress subdistribution of event of interest on cloglog of estimated risks
+calib_fgr <- FGR(
+  formula = form_fgr,
+  cause = primary_event,
+  data = vdata_bis
+)
+
+# Add observed and predicted together in a data frame
+dat_fgr <- cbind.data.frame(
+  "obs" = predict(calib_fgr, times = horizon, newdata = vdata_bis),
+  "pred" = vdata$pred
+)
+
+# Calibration plot
+dat_fgr <- dat_fgr[order(dat_fgr$pred), ]
+par(xaxs = "i", yaxs = "i", las = 1)
+plot(
+  x = dat_fgr$pred,
+  y = dat_fgr$obs,
+  type = "l",
+  xlim = c(0, 0.6),
+  ylim = c(0, 0.6),
+  xlab = "Predictions",
+  ylab = "Observed outcome proportion",
+  bty = "n"
+)
+abline(a = 0, b = 1, lty = "dashed", col = "red")
+title("Calibration plot using subdistribution hazard approach", 
+      cex.main = .90)
+```
+</details>
+
+```{r, plot_sd, fig.align='center',warning=FALSE,message=FALSE,eval=FALSE,echo=TRUE}
+## MM & noMM cohorts
+
+# Calibration plot (flexible regression approach) -------------------------
+
+# Add estimated risk and complementary log-log of it to dataset
+rdata_mm$pred_SCREAM_mm <- predictRisk(fit_csh,
+  cause = primary_event,
+  newdata = rdata_mm,
+  times = horizon
+)
+
+rdata_mm$cll_pred <- log(-log(1 - pred_SCREAM_mm))
+
+rdata_nomm$pred_SCREAM_nomm <- predictRisk(fit_csh,
+  cause = primary_event,
+  newdata = rdata_nomm,
+  times = horizon
+)
+
+rdata_nomm$cll_pred <- log(-log(1 - pred_SCREAM_nomm))
+
+
+vdata_mm$pred_UKB_mm <- predictRisk(fit_csh,
+  cause = primary_event,
+  newdata = vdata_mm,
+  times = horizon
+)
+
+vdata_mm$cll_pred <- log(-log(1 - pred_UKB_mm))
+
+vdata_nomm$pred_UKB_nomm <- predictRisk(fit_csh,
+  cause = primary_event,
+  newdata = vdata_nomm,
+  times = horizon
+)
+
+vdata_nomm$cll_pred <- log(-log(1 - pred_UKB_nomm))
+
+# 5 knots seems to give somewhat equivalent graph to pseudo method with bw = 0.05
+n_internal_knots <- 5 # Austin et al. advise to use between 3 (more smoothing, less flexible) and 5 (less smoothing, more flexible)
+rcs_vdata <- ns(vdata$cll_pred, df = n_internal_knots + 1)
+
+colnames(rcs_vdata) <- paste0("basisf_", colnames(rcs_vdata))
+
+vdata_bis <- cbind.data.frame(vdata, rcs_vdata)
+
+
+rcs_rdata_mm <- ns(rdata_mm$cll_pred, df = n_internal_knots + 1)
+
+colnames(rcs_rdata_mm) <- paste0("basisf_", colnames(rcs_rdata_mm))
+
+rdata_bis_mm <- cbind.data.frame(rdata_mm, rcs_rdata_mm)
+
+rcs_rdata_nomm <- ns(rdata_nomm$cll_pred, df = n_internal_knots + 1)
+
+colnames(rcs_rdata_nomm) <- paste0("basisf_", colnames(rcs_rdata_nomm))
+
+rdata_bis_nomm <- cbind.data.frame(rdata_nomm, rcs_rdata_nomm)
+
+
+rcs_vdata_mm <- ns(vdata_mm$cll_pred, df = n_internal_knots + 1)
+
+colnames(rcs_vdata_mm) <- paste0("basisf_", colnames(rcs_vdata_mm))
+
+vdata_bis_mm <- cbind.data.frame(vdata_mm, rcs_vdata_mm)
+
+rcs_vdata_nomm <- ns(vdata_nomm$cll_pred, df = n_internal_knots + 1)
+
+colnames(rcs_vdata_nomm) <- paste0("basisf_", colnames(rcs_vdata_nomm))
+
+vdata_bis_nomm <- cbind.data.frame(vdata_nomm, rcs_vdata_nomm)
+
+# Use subdistribution hazards (Fine-Gray) model
+form_fgr <- reformulate(
+  termlabels = colnames(rcs_vdata),
+  response = "Hist(time, event)"
+)
+
+# Regress subdistribution of event of interest on cloglog of estimated risks
+calib_fgr <- FGR(
+  formula = form_fgr,
+  cause = primary_event,
+  data = vdata_bis
+)
+
+calib_fgr_SCREAM_mm <- FGR(
+  formula = form_fgr,
+  cause = primary_event,
+  data = rdata_bis_mm
+)
+calib_fgr_SCREAM_nomm <- FGR(
+  formula = form_fgr,
+  cause = primary_event,
+  data = rdata_bis_nomm
+)
+calib_fgr_UKB_mm <- FGR(
+  formula = form_fgr,
+  cause = primary_event,
+  data = vdata_bis_mm
+)
+calib_fgr_UKB_nomm <- FGR(
+  formula = form_fgr,
+  cause = primary_event,
+  data = vdata_bis_nomm
+)
+
+# Add observed and predicted together in a data frame
+dat_fgr <- cbind.data.frame(
+  "obs" = predict(calib_fgr, times = horizon, newdata = vdata_bis),
+  "pred" = vdata$pred)
+
+dat_fgr_SCREAM_mm <- cbind.data.frame(
+  "obs" = predict(calib_fgr_SCREAM_mm, times = horizon, newdata = rdata_bis_mm),
+  "pred" = rdata_mm$pred) 
+
+dat_fgr_SCREAM_nomm <- cbind.data.frame(
+  "obs" = predict(calib_fgr_SCREAM_nomm, times = horizon, newdata = rdata_bis_nomm),
+  "pred" = rdata_nomm$pred) 
+
+dat_fgr_UKB_mm <- cbind.data.frame(
+  "obs" = predict(calib_fgr_UKB_mm, times = horizon, newdata = vdata_bis_mm),
+  "pred" = vdata_mm$pred) 
+
+dat_fgr_UKB_nomm <- cbind.data.frame(
+  "obs" = predict(calib_fgr_UKB_nomm, times = horizon, newdata = vdata_bis_nomm),
+  "pred" = vdata_nomm$pred) 
+
+# Calibration plot
+dat_fgr <- dat_fgr[order(dat_fgr$pred), ]
+par(xaxs = "i", yaxs = "i", las = 1)
+plot(
+  x = dat_fgr$pred,
+  y = dat_fgr$obs,
+  type = "l",
+  xlim = c(0, 1.0),
+  ylim = c(0, 1.0),
+  xlab = "Predictions",
+  ylab = "Observed outcome proportion",
+  bty = "n"
+)
+abline(a = 0, b = 1, lty = "dashed", col = "red")
+title("Calibration plot using subdistribution hazard approach", 
+      cex.main = .90)
+
+
+dat_fgr_SCREAM_mm <- dat_fgr_SCREAM_mm[order(dat_fgr_SCREAM_mm$pred), ]
+par(xaxs = "i", yaxs = "i", las = 1)
+plot(
+  x = dat_fgr_SCREAM_mm$pred,
+  y = dat_fgr_SCREAM_mm$obs,
+  type = "l",
+  xlim = c(0, 1.0),
+  ylim = c(0, 1.0),
+  xlab = "Predictions",
+  ylab = "Observed outcome proportion",
+  bty = "n"
+)
+abline(a = 0, b = 1, lty = "dashed", col = "red")
+title("Calibration plot using subdistribution hazard approach:\nSCREAM multimorbidity cohort", 
+      cex.main = .90)
+
+dat_fgr_SCREAM_nomm <- dat_fgr_SCREAM_nomm[order(dat_fgr_SCREAM_nomm$pred), ]
+par(xaxs = "i", yaxs = "i", las = 1)
+plot(
+  x = dat_fgr_SCREAM_nomm$pred,
+  y = dat_fgr_SCREAM_nomm$obs,
+  type = "l",
+  xlim = c(0, 1.0),
+  ylim = c(0, 1.0),
+  xlab = "Predictions",
+  ylab = "Observed outcome proportion",
+  bty = "n"
+)
+abline(a = 0, b = 1, lty = "dashed", col = "red")
+title("Calibration plot using subdistribution hazard approach:\nSCREAM no multimorbidity cohort", 
+      cex.main = .90)
+
+dat_fgr_UKB_mm <- dat_fgr_UKB_mm[order(dat_fgr_UKB_mm$pred), ]
+par(xaxs = "i", yaxs = "i", las = 1)
+plot(
+  x = dat_fgr_UKB_mm$pred,
+  y = dat_fgr_UKB_mm$obs,
+  type = "l",
+  xlim = c(0, 1.0),
+  ylim = c(0, 1.0),
+  xlab = "Predictions",
+  ylab = "Observed outcome proportion",
+  bty = "n"
+)
+abline(a = 0, b = 1, lty = "dashed", col = "red")
+title("Calibration plot using subdistribution hazard approach:\nUK Biobank multimorbidity cohort", 
+      cex.main = .90)
+
+dat_fgr_UKB_nomm <- dat_fgr_UKB_nomm[order(dat_fgr_UKB_nomm$pred), ]
+par(xaxs = "i", yaxs = "i", las = 1)
+plot(
+  x = dat_fgr_UKB_nomm$pred,
+  y = dat_fgr_UKB_nomm$obs,
+  type = "l",
+  xlim = c(0, 1.0),
+  ylim = c(0, 1.0),
+  xlab = "Predictions",
+  ylab = "Observed outcome proportion",
+  bty = "n"
+)
+abline(a = 0, b = 1, lty = "dashed", col = "red")
+title("Calibration plot using subdistribution hazard approach:\nUK Biobank no multimorbidity cohort", 
+      cex.main = .90)
+```
+
+```{r, plot_sd, fig.align='center',warning=FALSE,message=FALSE,echo=FALSE,eval=TRUE, fig.width=5, fig.height=5}
+```
+
+
+##### 2.1.2.2 Numerical summaries of calibration using the subdistribution hazard approach
+Here we assess calibration using the subdistribution hazard approach (Austin et al.)
+
+<details>
+  <summary>Click to expand code</summary>
+```{r, num_cal_sd, fig.align='center',warning=FALSE,message=FALSE,eval=FALSE, echo=TRUE}
+# Numerical summary measures
+diff_fgr <- dat_fgr$pred - dat_fgr$obs
+diff_fgr_SCREAM_mm <- dat_fgr_SCREAM_mm$pred - dat_fgr_SCREAM_mm$obs
+diff_fgr_SCREAM_nomm <- dat_fgr_SCREAM_nomm$pred - dat_fgr_SCREAM_nomm$obs
+diff_fgr_UKB_mm <- dat_fgr_UKB_mm$pred - dat_fgr_UKB_mm$obs
+diff_fgr_UKB_nomm <- dat_fgr_UKB_nomm$pred - dat_fgr_UKB_nomm$obs
+
+numsum_fgr <- c(
+  "ICI" = mean(abs(diff_fgr)),
+  setNames(quantile(abs(diff_fgr), c(0.5, 0.9)), c("E50", "E90")),
+  "Emax" = max(abs(diff_fgr)),
+  "Root squared bias" = sqrt(mean(diff_fgr^2))
+)
+
+
+numsum_fgr <- data.frame(
+  Measure = c("ICI", "E50", "E90", "Emax", "Root squared bias"),
+  UKB_validation = c(mean(abs(diff_fgr)),
+             quantile(abs(diff_fgr), c(0.5)),
+             quantile(abs(diff_fgr), c(0.9)),
+             max(abs(diff_fgr)),
+             sqrt(mean(diff_fgr^2))),
+  SCREAM_mm = c(mean(abs(diff_fgr_SCREAM_mm)),
+                quantile(abs(diff_fgr_SCREAM_mm), c(0.5)),
+                quantile(abs(diff_fgr_SCREAM_mm), c(0.9)),
+                max(abs(diff_fgr_SCREAM_mm)),
+                sqrt(mean(diff_fgr_SCREAM_mm^2))),
+  SCREAM_nomm = c(mean(abs(diff_fgr_SCREAM_nomm)),
+                  quantile(abs(diff_fgr_SCREAM_nomm), c(0.5)),
+                  quantile(abs(diff_fgr_SCREAM_nomm), c(0.9)),
+                  max(abs(diff_fgr_SCREAM_nomm)),
+                  sqrt(mean(diff_fgr_SCREAM_nomm^2))),
+  UKB_mm = c(mean(abs(diff_fgr_UKB_mm)),
+             quantile(abs(diff_fgr_UKB_mm), c(0.5)),
+             quantile(abs(diff_fgr_UKB_mm), c(0.9)),
+             max(abs(diff_fgr_UKB_mm)),
+             sqrt(mean(diff_fgr_UKB_mm^2))),
+  UKB_nomm = c(mean(abs(diff_fgr_UKB_nomm)),
+               quantile(abs(diff_fgr_UKB_nomm), c(0.5)),
+               quantile(abs(diff_fgr_UKB_nomm), c(0.9)),
+               max(abs(diff_fgr_UKB_nomm)),
+               sqrt(mean(diff_fgr_UKB_nomm^2)))
+)
+```
+</details>
+
+```{r, num_cal_sd, fig.align='center',warning=FALSE,message=FALSE,echo=FALSE,eval=TRUE, fig.width=5, fig.height=5}
+```
+
+```{r, num_cal_sd_out, fig.align='center',warning=FALSE,message=FALSE,echo=FALSE}
+k <- 4
+res_num <- rbind(
+  "Calibration measures - subdistribution " = numsum_fgr
+)
+
+kable(res_num) |>
+  kable_styling("striped", position = "center")
+
+
+
+```
+#### 2.1.2.3 Calibration plot using pseudo-observations (LOESS smoothing)
+
+<details>
+  <summary>Click to expand code</summary>
+```{r loess_pseudo, echo=TRUE, eval=FALSE, fig.width=5, fig.height=5, fig.align='center'}
+# Use pseudo-observations calculated by Score() (can alternatively use pseudo::pseudoci)
+pseudos <- data.frame(score_vdata$Calibration$plotframe)
+pseudos <- pseudos[order(pseudos$risk), ]
+
+# Use linear loess (weighted local regression with polynomial degree = 1) smoothing
+smooth_pseudos <- predict(
+  stats::loess(pseudovalue ~ risk, data = pseudos, degree = 1, span = 0.33), 
+  se = TRUE
+)
+
+# Calibration plot (reported in manuscript):
+
+# First, prepare histogram of estimated risks for x-axis
+spike_bounds <- c(-0.075, 0)
+bin_breaks <- seq(0, 0.6, length.out = 100 + 1)
+freqs <- table(cut(pred, breaks = bin_breaks))
+bins <- bin_breaks[-1]
+freqs_valid <- freqs[freqs > 0]
+freqs_rescaled <- spike_bounds[1] + (spike_bounds[2] - spike_bounds[1]) * 
+  (freqs_valid - min(freqs_valid)) / (max(freqs_valid) - min(freqs_valid))
+
+# Produce plot
+par(xaxs = "i", yaxs = "i", las = 1)
+plot(
+  x = pseudos$risk, 
+  y = pseudos$pseudovalue,
+  xlim = c(0, 0.6), 
+  ylim = c(spike_bounds[1], 0.6),
+  yaxt = "n",
+  frame.plot = FALSE,
+  xlab = "Estimated risks",
+  ylab = "Observed outcome proportions", 
+  type = "n"
+)
+axis(2, seq(0, 0.6, by = 0.1), labels = seq(0, 0.6, by = 0.1))
+polygon(
+  x = c(pseudos$risk, rev(pseudos$risk)),
+  y = c(
+    pmax(smooth_pseudos$fit - qt(0.975, smooth_pseudos$df) * smooth_pseudos$se, 0),
+    rev(smooth_pseudos$fit + qt(0.975, smooth_pseudos$df) * smooth_pseudos$se)
+  ),
+  border = FALSE,
+  col = "lightgray"
+)
+abline(a = 0, b = 1, col = "gray")
+lines(x = pseudos$risk, y = smooth_pseudos$fit, lwd = 2)
+segments(
+  x0 = bins[freqs > 0], 
+  y0 = spike_bounds[1], 
+  x1 = bins[freqs > 0], 
+  y1 = freqs_rescaled
+)
+title("Calibration plot using pseudo-observations (LOESS smoothing):\nvdata", cex.main = .90)
+
+```
+</details>
+
+```{r loess_pseudo, echo=TRUE, eval=FALSE, fig.width=5, fig.height=5, fig.align='center'}
+####SCREAM Multimorbidity
+# Use pseudo-observations calculated by Score() (can alternatively use pseudo::pseudoci)
+pseudos_SCREAM_mm <- data.frame(score_vdata_mm$Calibration$plotframe)
+pseudos_SCREAM_mm <- pseudos_SCREAM_mm[order(pseudos_SCREAM_mm$risk), ]
+
+# Use linear loess (weighted local regression with polynomial degree = 1) smoothing
+smooth_pseudos_SCREAM_mm <- predict(
+  stats::loess(pseudovalue ~ risk, data = pseudos_SCREAM_mm, degree = 1, span = 0.33), 
+  se = TRUE
+)
+
+# Calibration plot (reported in manuscript):
+
+# First, prepare histogram of estimated risks for x-axis
+spike_bounds <- c(-0.075, 0)
+bin_breaks <- seq(0, 0.6, length.out = 100 + 1)
+freqs <- table(cut(pred, breaks = bin_breaks))
+bins <- bin_breaks[-1]
+freqs_valid <- freqs[freqs > 0]
+freqs_rescaled <- spike_bounds[1] + (spike_bounds[2] - spike_bounds[1]) * 
+  (freqs_valid - min(freqs_valid)) / (max(freqs_valid) - min(freqs_valid))
+
+# Produce plot
+par(xaxs = "i", yaxs = "i", las = 1)
+plot(
+  x = pseudos_SCREAM_mm$risk, 
+  y = pseudos_SCREAM_mm$pseudovalue,
+  xlim = c(0, 0.6), 
+  ylim = c(spike_bounds[1], 0.6),
+  yaxt = "n",
+  frame.plot = FALSE,
+  xlab = "Estimated risks",
+  ylab = "Observed outcome proportions", 
+  type = "n"
+)
+axis(2, seq(0, 0.6, by = 0.1), labels = seq(0, 0.6, by = 0.1))
+polygon(
+  x = c(pseudos_SCREAM_mm$risk, rev(pseudos_SCREAM_mm$risk)),
+  y = c(
+    pmax(smooth_pseudos_SCREAM_mm$fit - qt(0.975, smooth_pseudos_SCREAM_mm$df) * smooth_pseudos_SCREAM_mm$se, 0),
+    rev(smooth_pseudos_SCREAM_mm$fit + qt(0.975, smooth_pseudos_SCREAM_mm$df) * smooth_pseudos_SCREAM_mm$se)
+  ),
+  border = FALSE,
+  col = "lightgray"
+)
+abline(a = 0, b = 1, col = "gray")
+lines(x = pseudos_SCREAM_mm$risk, y = smooth_pseudos_SCREAM_mm$fit, lwd = 2)
+segments(
+  x0 = bins[freqs > 0], 
+  y0 = spike_bounds[1], 
+  x1 = bins[freqs > 0], 
+  y1 = freqs_rescaled
+)
+title("Calibration plot using pseudo-observations (LOESS smoothing):\nSCREAM multimorbidity cohort", cex.main = .90)
+```
+
+```{r loess_pseudo, echo=TRUE, eval=FALSE, fig.width=5, fig.height=5, fig.align='center'}
+####SCREAM NO Multimorbidity
+# Use pseudo-observations calculated by Score() (can alternatively use pseudo::pseudoci)
+pseudos_SCREAM_nomm <- data.frame(score_vdata_nomm$Calibration$plotframe)
+pseudos_SCREAM_nomm <- pseudos_SCREAM_nomm[order(pseudos_SCREAM_nomm$risk), ]
+
+# Use linear loess (weighted local regression with polynomial degree = 1) smoothing
+smooth_pseudos_SCREAM_nomm <- predict(
+  stats::loess(pseudovalue ~ risk, data = pseudos_SCREAM_nomm, degree = 1, span = 0.33), 
+  se = TRUE
+)
+
+# Calibration plot (reported in manuscript):
+
+# First, prepare histogram of estimated risks for x-axis
+spike_bounds <- c(-0.075, 0)
+bin_breaks <- seq(0, 0.6, length.out = 100 + 1)
+freqs <- table(cut(pred, breaks = bin_breaks))
+bins <- bin_breaks[-1]
+freqs_valid <- freqs[freqs > 0]
+freqs_rescaled <- spike_bounds[1] + (spike_bounds[2] - spike_bounds[1]) * 
+  (freqs_valid - min(freqs_valid)) / (max(freqs_valid) - min(freqs_valid))
+
+# Produce plot
+par(xaxs = "i", yaxs = "i", las = 1)
+plot(
+  x = pseudos_SCREAM_nomm$risk, 
+  y = pseudos_SCREAM_nomm$pseudovalue,
+  xlim = c(0, 0.6), 
+  ylim = c(spike_bounds[1], 0.6),
+  yaxt = "n",
+  frame.plot = FALSE,
+  xlab = "Estimated risks",
+  ylab = "Observed outcome proportions", 
+  type = "n"
+)
+axis(2, seq(0, 0.6, by = 0.1), labels = seq(0, 0.6, by = 0.1))
+polygon(
+  x = c(pseudos_SCREAM_nomm$risk, rev(pseudos_SCREAM_nomm$risk)),
+  y = c(
+    pmax(smooth_pseudos_SCREAM_nomm$fit - qt(0.975, smooth_pseudos_SCREAM_nomm$df) * smooth_pseudos_SCREAM_nomm$se, 0),
+    rev(smooth_pseudos_SCREAM_nomm$fit + qt(0.975, smooth_pseudos_SCREAM_nomm$df) * smooth_pseudos_SCREAM_nomm$se)
+  ),
+  border = FALSE,
+  col = "lightgray"
+)
+abline(a = 0, b = 1, col = "gray")
+lines(x = pseudos_SCREAM_nomm$risk, y = smooth_pseudos_SCREAM_nomm$fit, lwd = 2)
+segments(
+  x0 = bins[freqs > 0], 
+  y0 = spike_bounds[1], 
+  x1 = bins[freqs > 0], 
+  y1 = freqs_rescaled
+)
+title("Calibration plot using pseudo-observations (LOESS smoothing):\nSCREAM no multimorbidity cohort", cex.main = .90)
+```
+
+```{r loess_pseudo, echo=TRUE, eval=FALSE, fig.width=5, fig.height=5, fig.align='center'}
+####UKB Multimorbidity
+# Use pseudo-observations calculated by Score() (can alternatively use pseudo::pseudoci)
+pseudos_UKB_mm <- data.frame(score_rdata_mm$Calibration$plotframe)
+pseudos_UKB_mm <- pseudos_UKB_mm[order(pseudos_UKB_mm$risk), ]
+
+# Use linear loess (weighted local regression with polynomial degree = 1) smoothing
+smooth_pseudos_UKB_mm <- predict(
+  stats::loess(pseudovalue ~ risk, data = pseudos_UKB_mm, degree = 1, span = 0.33), 
+  se = TRUE
+)
+
+# Calibration plot (reported in manuscript):
+
+# First, prepare histogram of estimated risks for x-axis
+spike_bounds <- c(-0.075, 0)
+bin_breaks <- seq(0, 0.6, length.out = 100 + 1)
+freqs <- table(cut(pred, breaks = bin_breaks))
+bins <- bin_breaks[-1]
+freqs_valid <- freqs[freqs > 0]
+freqs_rescaled <- spike_bounds[1] + (spike_bounds[2] - spike_bounds[1]) * 
+  (freqs_valid - min(freqs_valid)) / (max(freqs_valid) - min(freqs_valid))
+
+# Produce plot
+par(xaxs = "i", yaxs = "i", las = 1)
+plot(
+  x = pseudos_UKB_mm$risk, 
+  y = pseudos_UKB_mm$pseudovalue,
+  xlim = c(0, 0.6), 
+  ylim = c(spike_bounds[1], 0.6),
+  yaxt = "n",
+  frame.plot = FALSE,
+  xlab = "Estimated risks",
+  ylab = "Observed outcome proportions", 
+  type = "n"
+)
+axis(2, seq(0, 0.6, by = 0.1), labels = seq(0, 0.6, by = 0.1))
+polygon(
+  x = c(pseudos_UKB_mm$risk, rev(pseudos_UKB_mm$risk)),
+  y = c(
+    pmax(smooth_pseudos_UKB_mm$fit - qt(0.975, smooth_pseudos_UKB_mm$df) * smooth_pseudos_UKB_mm$se, 0),
+    rev(smooth_pseudos_UKB_mm$fit + qt(0.975, smooth_pseudos_UKB_mm$df) * smooth_pseudos_UKB_mm$se)
+  ),
+  border = FALSE,
+  col = "lightgray"
+)
+abline(a = 0, b = 1, col = "gray")
+lines(x = pseudos_UKB_mm$risk, y = smooth_pseudos_UKB_mm$fit, lwd = 2)
+segments(
+  x0 = bins[freqs > 0], 
+  y0 = spike_bounds[1], 
+  x1 = bins[freqs > 0], 
+  y1 = freqs_rescaled
+)
+title("Calibration plot using pseudo-observations (LOESS smoothing):\nUK Biobank multimorbidity cohort", cex.main = .90)
+```
+
+```{r loess_pseudo, echo=TRUE, eval=FALSE, fig.width=5, fig.height=5, fig.align='center'}
+####UKB NO Multimorbidity
+# Use pseudo-observations calculated by Score() (can alternatively use pseudo::pseudoci)
+pseudos_UKB_nomm <- data.frame(score_rdata_nomm$Calibration$plotframe)
+pseudos_UKB_nomm <- pseudos_UKB_nomm[order(pseudos_UKB_nomm$risk), ]
+
+# Use linear loess (weighted local regression with polynomial degree = 1) smoothing
+smooth_pseudos_UKB_nomm <- predict(
+  stats::loess(pseudovalue ~ risk, data = pseudos_UKB_nomm, degree = 1, span = 0.33), 
+  se = TRUE
+)
+
+# Calibration plot (reported in manuscript):
+
+# First, prepare histogram of estimated risks for x-axis
+spike_bounds <- c(-0.075, 0)
+bin_breaks <- seq(0, 0.6, length.out = 100 + 1)
+freqs <- table(cut(pred, breaks = bin_breaks))
+bins <- bin_breaks[-1]
+freqs_valid <- freqs[freqs > 0]
+freqs_rescaled <- spike_bounds[1] + (spike_bounds[2] - spike_bounds[1]) * 
+  (freqs_valid - min(freqs_valid)) / (max(freqs_valid) - min(freqs_valid))
+
+# Produce plot
+par(xaxs = "i", yaxs = "i", las = 1)
+plot(
+  x = pseudos_UKB_nomm$risk, 
+  y = pseudos_UKB_nomm$pseudovalue,
+  xlim = c(0, 0.6), 
+  ylim = c(spike_bounds[1], 0.6),
+  yaxt = "n",
+  frame.plot = FALSE,
+  xlab = "Estimated risks",
+  ylab = "Observed outcome proportions", 
+  type = "n"
+)
+axis(2, seq(0, 0.6, by = 0.1), labels = seq(0, 0.6, by = 0.1))
+polygon(
+  x = c(pseudos_UKB_nomm$risk, rev(pseudos_UKB_nomm$risk)),
+  y = c(
+    pmax(smooth_pseudos_UKB_nomm$fit - qt(0.975, smooth_pseudos_UKB_nomm$df) * smooth_pseudos_UKB_nomm$se, 0),
+    rev(smooth_pseudos_UKB_nomm$fit + qt(0.975, smooth_pseudos_UKB_nomm$df) * smooth_pseudos_UKB_nomm$se)
+  ),
+  border = FALSE,
+  col = "lightgray"
+)
+abline(a = 0, b = 1, col = "gray")
+lines(x = pseudos_UKB_nomm$risk, y = smooth_pseudos_UKB_nomm$fit, lwd = 2)
+segments(
+  x0 = bins[freqs > 0], 
+  y0 = spike_bounds[1], 
+  x1 = bins[freqs > 0], 
+  y1 = freqs_rescaled
+)
+title("Calibration plot using pseudo-observations (LOESS smoothing):\nUK Biobank no multimorbidity cohort", cex.main = .90)
+```
+
+```{r loess_pseudo, echo=FALSE, eval=TRUE, fig.width=5, fig.height=5, fig.align='center'}
+```
+
+
+#### 2.1.3 Observed and Expected ratio
+
+<details>
+  <summary>Click to expand code</summary>
+```{r, oe_ratio, fig.align='center',warning=FALSE,message=FALSE,echo=TRUE}
+
+# Models ----------
+fit_csh <- CSC(Hist(time, event) ~
+age + sexnumber + egfrcr09_race_allnonblack + lnacr2,
+data = rdata,
+fitter = "cph"
+)
+
+
+# useful objects
+primary_event <- 1 # Set to 2 if cause 2 was of interest
+horizon <- 5 # Set time horizon for prediction (here 5 years)
+
+# Add estimated risk and complementary log-log of it to dataset
+pred <- predictRisk(fit_csh,
+  cause = primary_event,
+  newdata = vdata,
+  times = horizon
+)
+
+pred_SCREAM_mm <- predictRisk(fit_csh,
+  cause = primary_event,
+  newdata = rdata_mm,
+  times = horizon
+)
+pred_SCREAM_nomm <- predictRisk(fit_csh,
+  cause = primary_event,
+  newdata = rdata_nomm,
+  times = horizon
+)
+
+pred_UKB_mm <- predictRisk(fit_csh,
+  cause = primary_event,
+  newdata = vdata_mm,
+  times = horizon
+)
+pred_UKB_nomm <- predictRisk(fit_csh,
+  cause = primary_event,
+  newdata = vdata_nomm,
+  times = horizon
+)
+
+## Observed/Expected ratio --------------------------------------------
+# First calculate Aalen-Johansen estimate (as 'observed')
+obj <- summary(survfit(Surv(time, status) ~ 1,
+  data = vdata
+),
+times = horizon
+)
+
+aj <- list(
+  "obs" = obj$pstate[, primary_event + 1],
+  "se" = obj$std.err[, primary_event + 1]
+)
+
+obj_SCREAM_mm <- summary(survfit(Surv(time, status) ~ 1,
+  data = rdata_mm
+),
+times = horizon
+)
+
+aj_SCREAM_mm <- list(
+  "obs" = obj_SCREAM_mm$pstate[, primary_event + 1],
+  "se" = obj_SCREAM_mm$std.err[, primary_event + 1]
+)
+
+obj_SCREAM_nomm <- summary(survfit(Surv(time, status) ~ 1,
+  data = rdata_nomm
+),
+times = horizon
+)
+
+aj_SCREAM_nomm <- list(
+  "obs" = obj_SCREAM_nomm$pstate[, primary_event + 1],
+  "se" = obj_SCREAM_nomm$std.err[, primary_event + 1]
+)
+
+
+obj_UKB_mm <- summary(survfit(Surv(time, status) ~ 1,
+  data = vdata_mm
+),
+times = horizon
+)
+
+aj_UKB_mm <- list(
+  "obs" = obj_UKB_mm$pstate[, primary_event + 1],
+  "se" = obj_UKB_mm$std.err[, primary_event + 1]
+)
+
+obj_UKB_nomm <- summary(survfit(Surv(time, status) ~ 1,
+  data = vdata_nomm
+),
+times = horizon
+)
+
+aj_UKB_nomm <- list(
+  "obs" = obj_UKB_nomm$pstate[, primary_event + 1],
+  "se" = obj_UKB_nomm$std.err[, primary_event + 1]
+)
+
+# Calculate O/E
+OE <- aj$obs / mean(pred)
+OE_SCREAM_mm <- aj_SCREAM_mm$obs / mean(pred_SCREAM_mm)
+OE_SCREAM_nomm <- aj_SCREAM_nomm$obs / mean(pred_SCREAM_nomm)
+OE_UKB_mm <- aj_UKB_mm$obs / mean(pred_UKB_mm)
+OE_UKB_nomm <- aj_UKB_nomm$obs / mean(pred_UKB_nomm)
+
+# For the confidence interval we use method proposed in Debray et al. (2017) doi:10.1136/bmj.i6460
+k <- 2
+alpha <- 0.05
+OE_summary <- data.frame(
+  Measure = c("OE", "Lower .95", "Upper .95"),
+  UKB_validation = c(OE,
+             exp(log(OE) - qnorm(1 - alpha / 2) * aj$se / aj$obs),
+             exp(log(OE) + qnorm(1 - alpha / 2) * aj$se / aj$obs)),
+  SCREAM_mm = c(OE_SCREAM_mm,
+             exp(log(OE_SCREAM_mm) - qnorm(1 - alpha / 2) * aj_SCREAM_mm$se / aj_SCREAM_mm$obs),
+             exp(log(OE_SCREAM_mm) + qnorm(1 - alpha / 2) * aj_SCREAM_mm$se / aj_SCREAM_mm$obs)),
+  SCREAM_nomm = c(OE_SCREAM_nomm,
+             exp(log(OE_SCREAM_nomm) - qnorm(1 - alpha / 2) * aj_SCREAM_nomm$se / aj_SCREAM_nomm$obs),
+             exp(log(OE_SCREAM_nomm) + qnorm(1 - alpha / 2) * aj_SCREAM_nomm$se / aj_SCREAM_nomm$obs)),
+  UKB_mm = c(OE_UKB_mm,
+             exp(log(OE_UKB_mm) - qnorm(1 - alpha / 2) * aj_UKB_mm$se / aj_UKB_mm$obs),
+             exp(log(OE_UKB_mm) + qnorm(1 - alpha / 2) * aj_UKB_mm$se / aj_UKB_mm$obs)),
+  UKB_nomm = c(OE_UKB_nomm,
+             exp(log(OE_UKB_nomm) - qnorm(1 - alpha / 2) * aj_UKB_nomm$se / aj_UKB_nomm$obs),
+             exp(log(OE_UKB_nomm) + qnorm(1 - alpha / 2) * aj_UKB_nomm$se / aj_UKB_nomm$obs))
+)
+
+
+
+```
+</details>
+
+```{r, res_OE, echo=FALSE}
+# OE, Lower.95, Upper .95
+
+kable(OE_summary) |>
+  kable_styling("striped", position = "center")
+```
+
+
+#### 2.1.4 Calibration intercept and slope using pseudo observations
+
+
+<details>
+  <summary>Click to expand code</summary>
+```{r, cal_intslope_pseudo, fig.align='center',warning=FALSE,message=FALSE, echo=TRUE}
+
+# Models ----------
+fit_csh <- CSC(Hist(time, event) ~
+age + sexnumber + egfrcr09_race_allnonblack + lnacr2,
+data = rdata,
+fitter = "cph"
+)
+
+
+# useful objects
+primary_event <- 1 # Set to 2 if cause 2 was of interest
+horizon <- 5 # Set time horizon for prediction (here 5 years)
+
+# Predicted risk estimation
+pred <- predictRisk(fit_csh,
+  cause = primary_event,
+  times = horizon,
+  newdata = vdata
+)
+
+pred_SCREAM_mm <- predictRisk(fit_csh,
+  cause = primary_event,
+  times = horizon,
+  newdata = rdata_mm
+)
+
+pred_SCREAM_nomm <- predictRisk(fit_csh,
+  cause = primary_event,
+  times = horizon,
+  newdata = rdata_nomm
+)
+
+pred_UKB_mm <- predictRisk(fit_csh,
+  cause = primary_event,
+  times = horizon,
+  newdata = vdata_mm
+)
+
+pred_UKB_nomm <- predictRisk(fit_csh,
+  cause = primary_event,
+  times = horizon,
+  newdata = vdata_nomm
+)
+# Calibration plot (pseudo-obs approach) ----------------------------------
+# First compute riskRegression::Score()
+score_vdata <- Score(
+  list("csh_validation" = fit_csh),
+  formula = Hist(time, event) ~ 1,
+  cens.model = "km",
+  data = vdata,
+  conf.int = TRUE,
+  times = horizon,
+  #  metrics = c("auc", "brier"),
+  summary = c("ipa"),
+  cause = primary_event,
+  plots = "calibration"
+)
+
+score_rdata_SCREAM_mm <- Score(
+  list("csh_validation" = fit_csh),
+  formula = Hist(time, event) ~ 1,
+  cens.model = "km",
+  data = rdata_mm,
+  conf.int = TRUE,
+  times = horizon,
+  #  metrics = c("auc", "brier"),
+  summary = c("ipa"),
+  cause = primary_event,
+  plots = "calibration"
+)
+
+score_rdata_SCREAM_nomm <- Score(
+  list("csh_validation" = fit_csh),
+  formula = Hist(time, event) ~ 1,
+  cens.model = "km",
+  data = rdata_nomm,
+  conf.int = TRUE,
+  times = horizon,
+  #  metrics = c("auc", "brier"),
+  summary = c("ipa"),
+  cause = primary_event,
+  plots = "calibration"
+)
+
+score_vdata_UKB_mm <- Score(
+  list("csh_validation" = fit_csh),
+  formula = Hist(time, event) ~ 1,
+  cens.model = "km",
+  data = vdata_mm,
+  conf.int = TRUE,
+  times = horizon,
+  #  metrics = c("auc", "brier"),
+  summary = c("ipa"),
+  cause = primary_event,
+  plots = "calibration"
+)
+
+score_vdata_UKB_nomm <- Score(
+  list("csh_validation" = fit_csh),
+  formula = Hist(time, event) ~ 1,
+  cens.model = "km",
+  data = vdata_nomm,
+  conf.int = TRUE,
+  times = horizon,
+  #  metrics = c("auc", "brier"),
+  summary = c("ipa"),
+  cause = primary_event,
+  plots = "calibration"
+)
+
+
+## Calibration intercept and slope --------------------------------------
+# Use pseudo-observations calculated by Score() (can alternatively use pseudo::pseudoci)
+pseudos <- data.frame(score_vdata$Calibration$plotframe)
+pseudos_SCREAM_mm <- data.frame(score_rdata_SCREAM_mm$Calibration$plotframe)
+pseudos_SCREAM_nomm <- data.frame(score_rdata_SCREAM_nomm$Calibration$plotframe)
+pseudos_UKB_mm <- data.frame(score_vdata_UKB_mm$Calibration$plotframe)
+pseudos_UKB_nomm <- data.frame(score_vdata_UKB_nomm$Calibration$plotframe)
+
+# Note:
+# - 'pseudos' is the data.frame with ACTUAL pseudo-observations, not the smoothed ones
+# - Column ID is not the id in vdata; it is just a number assigned to each row of
+# the original validation data sorted by time and event indicator
+pseudos$cll_pred <- log(-log(1 - pseudos$risk)) # add the cloglog risk ests
+pseudos_SCREAM_mm$cll_pred <- log(-log(1 - pseudos_SCREAM_mm$risk))
+pseudos_SCREAM_nomm$cll_pred <- log(-log(1 - pseudos_SCREAM_nomm$risk))
+pseudos_UKB_mm$cll_pred <- log(-log(1 - pseudos_UKB_mm$risk))
+pseudos_UKB_nomm$cll_pred <- log(-log(1 - pseudos_UKB_nomm$risk))
+# Fit model for calibration intercept
+fit_cal_int <- geese(
+  pseudovalue ~ offset(cll_pred),
+  data = pseudos,
+  id = ID,
+  scale.fix = TRUE,
+  family = gaussian,
+  mean.link = "cloglog",
+  corstr = "independence",
+  jack = TRUE
+)
+
+fit_cal_int_SCREAM_mm <- geese(
+  pseudovalue ~ offset(cll_pred),
+  data = pseudos_SCREAM_mm,
+  id = ID,
+  scale.fix = TRUE,
+  family = gaussian,
+  mean.link = "cloglog",
+  corstr = "independence",
+  jack = TRUE
+)
+
+fit_cal_int_SCREAM_nomm <- geese(
+  pseudovalue ~ offset(cll_pred),
+  data = pseudos_SCREAM_nomm,
+  id = ID,
+  scale.fix = TRUE,
+  family = gaussian,
+  mean.link = "cloglog",
+  corstr = "independence",
+  jack = TRUE
+)
+
+fit_cal_int_UKB_mm <- geese(
+  pseudovalue ~ offset(cll_pred),
+  data = pseudos_UKB_mm,
+  id = ID,
+  scale.fix = TRUE,
+  family = gaussian,
+  mean.link = "cloglog",
+  corstr = "independence",
+  jack = TRUE
+)
+
+fit_cal_int_UKB_nomm <- geese(
+  pseudovalue ~ offset(cll_pred),
+  data = pseudos_UKB_nomm,
+  id = ID,
+  scale.fix = TRUE,
+  family = gaussian,
+  mean.link = "cloglog",
+  corstr = "independence",
+  jack = TRUE
+)
+
+# Fit model for calibration slope
+fit_cal_slope <- geese(
+  pseudovalue ~ offset(cll_pred) + cll_pred,
+  data = pseudos,
+  id = ID,
+  scale.fix = TRUE,
+  family = gaussian,
+  mean.link = "cloglog",
+  corstr = "independence",
+  jack = TRUE
+)
+
+fit_cal_slope_SCREAM_mm <- geese(
+  pseudovalue ~ offset(cll_pred) + cll_pred,
+  data = pseudos_SCREAM_mm,
+  id = ID,
+  scale.fix = TRUE,
+  family = gaussian,
+  mean.link = "cloglog",
+  corstr = "independence",
+  jack = TRUE
+)
+
+fit_cal_slope_SCREAM_nomm <- geese(
+  pseudovalue ~ offset(cll_pred) + cll_pred,
+  data = pseudos_SCREAM_nomm,
+  id = ID,
+  scale.fix = TRUE,
+  family = gaussian,
+  mean.link = "cloglog",
+  corstr = "independence",
+  jack = TRUE
+)
+
+fit_cal_slope_UKB_mm <- geese(
+  pseudovalue ~ offset(cll_pred) + cll_pred,
+  data = pseudos_UKB_mm,
+  id = ID,
+  scale.fix = TRUE,
+  family = gaussian,
+  mean.link = "cloglog",
+  corstr = "independence",
+  jack = TRUE
+)
+
+fit_cal_slope_UKB_nomm <- geese(
+  pseudovalue ~ offset(cll_pred) + cll_pred,
+  data = pseudos_UKB_nomm,
+  id = ID,
+  scale.fix = TRUE,
+  family = gaussian,
+  mean.link = "cloglog",
+  corstr = "independence",
+  jack = TRUE
+)
+
+# Perform joint test on intercept and slope
+betas <- fit_cal_slope$beta
+vcov_mat <- fit_cal_slope$vbeta
+wald <- drop(betas %*% solve(vcov_mat) %*% betas)
+
+
+betas_SCREAM_mm <- fit_cal_slope_SCREAM_mm$beta
+vcov_mat_SCREAM_mm <- fit_cal_slope_SCREAM_mm$vbeta
+wald_SCREAM_mm <- drop(betas_SCREAM_mm %*% solve(vcov_mat_SCREAM_mm) %*% betas_SCREAM_mm)
+
+betas_SCREAM_nomm <- fit_cal_slope_SCREAM_nomm$beta
+vcov_mat_SCREAM_nomm <- fit_cal_slope_SCREAM_nomm$vbeta
+wald_SCREAM_nomm <- drop(betas_SCREAM_nomm %*% solve(vcov_mat_SCREAM_nomm) %*% betas_SCREAM_nomm)
+
+betas_UKB_mm <- fit_cal_slope_UKB_mm$beta
+vcov_mat_UKB_mm <- fit_cal_slope_UKB_mm$vbeta
+wald_UKB_mm <- drop(betas_UKB_mm %*% solve(vcov_mat_UKB_mm) %*% betas_UKB_mm)
+
+betas_UKB_nomm <- fit_cal_slope_UKB_nomm$beta
+vcov_mat_UKB_nomm <- fit_cal_slope_UKB_nomm$vbeta
+wald_UKB_nomm <- drop(betas_UKB_nomm %*% solve(vcov_mat_UKB_nomm) %*% betas_UKB_nomm)
+
+pchisq(wald, df = 2, lower.tail = FALSE)
+pchisq(wald_SCREAM_mm, df = 2, lower.tail = FALSE)
+pchisq(wald_SCREAM_nomm, df = 2, lower.tail = FALSE)
+pchisq(wald_UKB_mm, df = 2, lower.tail = FALSE)
+pchisq(wald_UKB_nomm, df = 2, lower.tail = FALSE)
+
+```
+</details>
+
+```{r, res_cal_intslope, echo=FALSE}
+# Define a function to extract calibration results
+extract_cal_results <- function(fit_cal_int, fit_cal_slope) {
+  intercept <- with(
+    summary(fit_cal_int)$mean,
+    c(
+      "estimate" = estimate,
+      `2.5 %` = estimate - qnorm(0.975) * san.se,
+      `97.5 %` = estimate + qnorm(0.975) * san.se
+    )
+  )
+  
+  slope <- with(
+    summary(fit_cal_slope)$mean["cll_pred", ],
+    c(
+      "estimate" = 1 + estimate,
+      `2.5 %` = 1 + (estimate - qnorm(0.975) * san.se),
+      `97.5 %` = 1 + (estimate + qnorm(0.975) * san.se)
+    )
+  )
+  
+  return(c(intercept, slope))
+}
+
+# Extract results for all datasets
+cal_results_pseudo <- extract_cal_results(fit_cal_int, fit_cal_slope)
+cal_results_SCREAM_mm <- extract_cal_results(fit_cal_int_SCREAM_mm, fit_cal_slope_SCREAM_mm)
+cal_results_SCREAM_nomm <- extract_cal_results(fit_cal_int_SCREAM_nomm, fit_cal_slope_SCREAM_nomm)
+cal_results_UKB_mm <- extract_cal_results(fit_cal_int_UKB_mm, fit_cal_slope_UKB_mm)
+cal_results_UKB_nomm <- extract_cal_results(fit_cal_int_UKB_nomm, fit_cal_slope_UKB_nomm)
+
+# Combine results into a data frame
+res_cal <- data.frame(
+  Dataset = c("Pseudo", "SCREAM_mm", "SCREAM_nomm", "UKB_mm", "UKB_nomm"),
+  Intercept = c(cal_results_pseudo[1], cal_results_SCREAM_mm[1], cal_results_SCREAM_nomm[1], cal_results_UKB_mm[1], cal_results_UKB_nomm[1]),
+  Intercept_2.5 = c(cal_results_pseudo[2], cal_results_SCREAM_mm[2], cal_results_SCREAM_nomm[2], cal_results_UKB_mm[2], cal_results_UKB_nomm[2]),
+  Intercept_97.5 = c(cal_results_pseudo[3], cal_results_SCREAM_mm[3], cal_results_SCREAM_nomm[3], cal_results_UKB_mm[3], cal_results_UKB_nomm[3]),
+  Slope = c(cal_results_pseudo[4], cal_results_SCREAM_mm[4], cal_results_SCREAM_nomm[4], cal_results_UKB_mm[4], cal_results_UKB_nomm[4]),
+  Slope_2.5 = c(cal_results_pseudo[5], cal_results_SCREAM_mm[5], cal_results_SCREAM_nomm[5], cal_results_UKB_mm[5], cal_results_UKB_nomm[5]),
+  Slope_97.5 = c(cal_results_pseudo[6], cal_results_SCREAM_mm[6], cal_results_SCREAM_nomm[6], cal_results_UKB_mm[6], cal_results_UKB_nomm[6])
+)
+
+
+# Create the table
+kable(res_cal) %>%
+  kable_styling("striped", position = "center")
+
+
+```
+
+### 2.2 Discrimination
+
+We here calculate
+
++ The 5-year C-index. More details are in the main manuscript and its references;
++ The 5-year time-dependent AUC. More details are in the manuscript and in its references;  
+  + Plot time-dependent AUC over the time;
+  
++ Royston-Sauerbrei D statistic and R<sup>2</sup><sub>D</sub> as a measure of prognostic separation;  
+
+  
+#### 2.2.1 C-index and time-dependent AUC
+
+<details>
+  <summary>Click to expand code</summary>
+```{r, discrimination,warning=FALSE,message=FALSE,echo=TRUE}
+# Models
+fit_csh <- CSC(Hist(time, event) ~
+age + sexnumber + egfrcr09_race_allnonblack + lnacr2,
+data = rdata,
+fitter = "cph"
+)
+
+# useful objects
+primary_event <- 1 # Set to 2 if cause 2 was of interest
+horizon <- 5 # Set time horizon for prediction (here 5 years)
+
+# C-index
+# Development set (Apparent validation)
+
+C_rdata <- pec::cindex(
+  object = fit_csh,
+  formula = Hist(time, event) ~ 1,
+  cause = primary_event,
+  eval.times = horizon,
+  data = rdata
+)$AppCindex$CauseSpecificCox
+
+# Validation set
+C_vdata <- pec::cindex(
+  object = fit_csh,
+  formula = Hist(time, event) ~ 1,
+  cause = primary_event,
+  eval.times = horizon,
+  data = vdata
+)$AppCindex$CauseSpecificCox
+
+# SCREAM mm vs no mm
+C_rdata_SCREAM_mm <- pec::cindex(
+  object = fit_csh,
+  formula = Hist(time, event) ~ 1,
+  cause = primary_event,
+  eval.times = horizon,
+  data = rdata_mm
+)$AppCindex$CauseSpecificCox
+
+C_rdata_SCREAM_nomm <- pec::cindex(
+  object = fit_csh,
+  formula = Hist(time, event) ~ 1,
+  cause = primary_event,
+  eval.times = horizon,
+  data = rdata_nomm
+)$AppCindex$CauseSpecificCox
+
+# UKB mm vs no mm
+C_vdata_UKB_mm <- pec::cindex(
+  object = fit_csh,
+  formula = Hist(time, event) ~ 1,
+  cause = primary_event,
+  eval.times = horizon,
+  data = vdata_mm
+)$AppCindex$CauseSpecificCox
+
+C_vdata_UKB_nomm <- pec::cindex(
+  object = fit_csh,
+  formula = Hist(time, event) ~ 1,
+  cause = primary_event,
+  eval.times = horizon,
+  data = vdata_nomm
+)$AppCindex$CauseSpecificCox
+
+# Bootstraping C-index to calculate the bootstrap percentile confidence intervals
+
+B <- 100
+set.seed(1234)
+rboot <- bootstraps(rdata, times = B) # development - bootstrap
+vboot <- bootstraps(vdata, times = B) # validation - bootstrap
+rboot_SCREAM_mm <- bootstraps(rdata_mm, times = B) # SCREAM_mm - bootstrap
+rboot_SCREAM_nomm <- bootstraps(rdata_nomm, times = B) # SCREAM_nomm - bootstrap
+vboot_UKB_mm <- bootstraps(vdata_mm, times = B) # UKB_mm - bootstrap
+vboot_UKB_nomm <- bootstraps(vdata_nomm, times = B) # UKB_nomm - bootstrap
+
+C_boot <- function(split) {
+  pec::cindex(
+    object = fit_csh,
+    formula = Hist(time, event) ~ 1,
+    cause = primary_event,
+    eval.times = horizon,
+    data = analysis(split)
+  )$AppCindex$CauseSpecificCox
+}
+
+bootstrap_cindex <- function(data, fit, primary_event, horizon, B) {
+  rboot <- bootstraps(data, times = B)
+  C_boot <- function(split) {
+    pec::cindex(
+      object = fit,
+      formula = Hist(time, event) ~ 1,
+      cause = primary_event,
+      eval.times = horizon,
+      data = analysis(split)
+    )$AppCindex$CauseSpecificCox
+  }
+  rboot <- rboot %>% mutate(C_boot = map_dbl(splits, C_boot))
+  ci <- quantile(rboot$C_boot, probs = c(0.025, 0.975), na.rm = TRUE)
+  list(C_boot = rboot$C_boot, ci = ci)
+}
+boot_dev <- bootstrap_cindex(rdata, fit_csh, primary_event, horizon, B)
+boot_val <- bootstrap_cindex(vdata, fit_csh, primary_event, horizon, B)
+boot_SCREAM_mm <- bootstrap_cindex(rdata_mm, fit_csh, primary_event, horizon, B)
+boot_SCREAM_nomm <- bootstrap_cindex(rdata_nomm, fit_csh, primary_event, horizon, B)
+boot_UKB_mm <- bootstrap_cindex(vdata_mm, fit_csh, primary_event, horizon, B)
+boot_UKB_nomm <- bootstrap_cindex(vdata_nomm, fit_csh, primary_event, horizon, B)
+
+# Run time-dependent AUC in the bootstrapped development and validation data
+# to calculate the non-parametric CI through percentile bootstrap
+rboot <- rboot |> mutate(
+  C_rboot = map_dbl(splits, C_boot),
+)
+vboot <- vboot |> mutate(
+  C_vboot = map_dbl(splits, C_boot),
+)
+rboot_SCREAM_mm <- rboot_SCREAM_mm |> mutate(
+  C_rboot_SCREAM_mm = map_dbl(splits, C_boot),
+)
+rboot_SCREAM_mm <- rboot_SCREAM_mm |> mutate(
+  C_rboot_SCREAM_mm = map_dbl(splits, C_boot),
+)
+vboot_UKB_mm <- vboot_UKB_mm |> mutate(
+  C_vboot_UKB_mm = map_dbl(splits, C_boot),
+)
+vboot_UKB_mm <- vboot_UKB_mm |> mutate(
+  C_vboot_UKB_mm = map_dbl(splits, C_boot),
+)
+
+# Time-dependent AUC ---------
+
+# Development data
+score_rdata <- Score(
+  list("csh_development" = fit_csh),
+  formula = Hist(time, event) ~ 1,
+  cens.model = "km",
+  data = rdata,
+  conf.int = TRUE,
+  times = horizon,
+  metrics = c("auc"),
+  cause = primary_event,
+  plots = "calibration"
+)
+
+# Validation data
+score_vdata <- Score(
+  list("csh_validation" = fit_csh),
+  formula = Hist(time, event) ~ 1,
+  cens.model = "km",
+  data = vdata,
+  conf.int = TRUE,
+  times = horizon,
+  metrics = c("auc"),
+  cause = primary_event,
+  plots = "calibration"
+)
+
+# SCREAM mm vs nomm
+score_rdata_SCREAM_mm <- Score(
+  list("csh_validation" = fit_csh),
+  formula = Hist(time, event) ~ 1,
+  cens.model = "km",
+  data = rdata_mm,
+  conf.int = TRUE,
+  times = horizon,
+  metrics = c("auc"),
+  cause = primary_event,
+  plots = "calibration"
+)
+
+score_rdata_SCREAM_nomm <- Score(
+  list("csh_validation" = fit_csh),
+  formula = Hist(time, event) ~ 1,
+  cens.model = "km",
+  data = rdata_nomm,
+  conf.int = TRUE,
+  times = horizon,
+  metrics = c("auc"),
+  cause = primary_event,
+  plots = "calibration"
+)
+
+# UKB mm vs nomm
+score_vdata_UKB_mm <- Score(
+  list("csh_validation" = fit_csh),
+  formula = Hist(time, event) ~ 1,
+  cens.model = "km",
+  data = vdata_mm,
+  conf.int = TRUE,
+  times = horizon,
+  metrics = c("auc"),
+  cause = primary_event,
+  plots = "calibration"
+)
+
+score_vdata_UKB_nomm <- Score(
+  list("csh_validation" = fit_csh),
+  formula = Hist(time, event) ~ 1,
+  cens.model = "km",
+  data = vdata_nomm,
+  conf.int = TRUE,
+  times = horizon,
+  metrics = c("auc"),
+  cause = primary_event,
+  plots = "calibration"
+)
+```
+</details>
+
+```{r, res_disc, fig.align='center',echo=FALSE}
+
+
+cindex_results <- data.frame(
+  Group = c("Development", "Validation", "SCREAM mm", "SCREAM nomm", "UKB mm", "UKB nomm"),
+  Cindex = c(C_rdata, C_vdata, C_rdata_SCREAM_mm, C_rdata_SCREAM_nomm, C_vdata_UKB_mm, C_vdata_UKB_nomm),
+  `2.5%` = c(boot_dev$ci[1], boot_val$ci[1], boot_SCREAM_mm$ci[1], boot_SCREAM_nomm$ci[1], boot_UKB_mm$ci[1], boot_UKB_nomm$ci[1]),
+  `97.5%` = c(boot_dev$ci[2], boot_val$ci[2], boot_SCREAM_mm$ci[2], boot_SCREAM_nomm$ci[2], boot_UKB_mm$ci[2], boot_UKB_nomm$ci[2])
+)
+
+# Print the table
+kable(cindex_results, col.names = c("Group", "Cindex", "2.5%", "97.5%")) %>%
+  kable_styling("striped", position = "center")
+
+
+  # AUC and Confidence Intervals
+
+calculate_auc <- function(data, fit, primary_event, horizon) {
+  score_obj <- Score(
+    list("csh" = fit),
+    formula = Hist(time, event) ~ 1,
+    cens.model = "km",
+    data = data,
+    conf.int = TRUE,
+    times = horizon,
+    metrics = c("auc"),
+    cause = primary_event,
+    plots = "calibration"
+  )
+  
+  auc <- score_obj$AUC$score$AUC
+  se <- score_obj$AUC$score$se
+  list(auc = auc, se = se)
+}
+
+# Calculate AUC for all groups
+score_rdata <- calculate_auc(rdata, fit_csh, primary_event, horizon)
+score_vdata <- calculate_auc(vdata, fit_csh, primary_event, horizon)
+score_rdata_SCREAM_mm <- calculate_auc(rdata_mm, fit_csh, primary_event, horizon)
+score_rdata_SCREAM_nomm <- calculate_auc(rdata_nomm, fit_csh, primary_event, horizon)
+score_vdata_UKB_mm <- calculate_auc(vdata_mm, fit_csh, primary_event, horizon)
+score_vdata_UKB_nomm <- calculate_auc(vdata_nomm, fit_csh, primary_event, horizon)
+
+alpha <- 0.05
+k <- 2
+
+AUC_results <- data.frame(
+  Group = c("Development", "Validation", "SCREAM mm", "SCREAM nomm", "UKB mm", "UKB nomm"),
+  AUC = c(score_rdata$auc, score_vdata$auc, score_rdata_SCREAM_mm$auc, score_rdata_SCREAM_nomm$auc, score_vdata_UKB_mm$auc, score_vdata_UKB_nomm$auc),
+  `2.5%` = c(score_rdata$auc - qnorm(1 - alpha / 2) * score_rdata$se, score_vdata$auc - qnorm(1 - alpha / 2) * score_vdata$se, score_rdata_SCREAM_mm$auc - qnorm(1 - alpha / 2) * score_rdata_SCREAM_mm$se, score_rdata_SCREAM_nomm$auc - qnorm(1 - alpha / 2) * score_rdata_SCREAM_nomm$se, score_vdata_UKB_mm$auc - qnorm(1 - alpha / 2) * score_vdata_UKB_mm$se, score_vdata_UKB_nomm$auc - qnorm(1 - alpha / 2) * score_vdata_UKB_nomm$se),
+  `97.5%` = c(score_rdata$auc + qnorm(1 - alpha / 2) * score_rdata$se, score_vdata$auc + qnorm(1 - alpha / 2) * score_vdata$se, score_rdata_SCREAM_mm$auc + qnorm(1 - alpha / 2) * score_rdata_SCREAM_mm$se, score_rdata_SCREAM_nomm$auc + qnorm(1 - alpha / 2) * score_rdata_SCREAM_nomm$se, score_vdata_UKB_mm$auc + qnorm(1 - alpha / 2) * score_vdata_UKB_mm$se, score_vdata_UKB_nomm$auc + qnorm(1 - alpha / 2) * score_vdata_UKB_nomm$se)
+)
+
+kable(AUC_results, col.names = c("Group", "AUC", "2.5%", "97.5%")) %>%
+  kable_styling("striped", position = "center")
+```
+
+
+The time-dependent AUC at 5 years was 0.92 (95%CI 0.90-0.94) and c-index was 0.92 (95% CI 0.90-0.93) in the validation (UK Biobank) set.
+
+#### 2.2.2 Plot Area under the curve(s) over the time
+We plot the time-dependent AUCs over the follow-up time using development and validation data. 
+
+<details>
+  <summary>Click to expand code</summary>
+```{r, plot_AUCs, warning=FALSE,echo=TRUE, eval=FALSE}
+
+# Models --------------
+fit_csh <- CSC(Hist(time, event) ~
+age + sexnumber + egfrcr09_race_allnonblack + lnacr2,
+data = rdata,
+fitter = "cph"
+)
+primary_event <- 1 # Set to 2 if cause 2 was of interest
+
+# AUCs development data
+AUC_rdata <- Score(
+  list("csh_development" = fit_csh),
+  formula = Hist(time, event) ~ 1,
+  cens.model = "km",
+  data = rdata,
+  conf.int = TRUE,
+  times = seq(0.4, 5.1, 0.2),
+  metrics = c("auc"),
+  cause = primary_event
+)
+
+# AUCs validation data
+AUC_vdata <- Score(
+  list("csh_validation" = fit_csh),
+  formula = Hist(time, event) ~ 1,
+  cens.model = "km",
+  data = vdata,
+  conf.int = TRUE,
+  times = seq(0.5, 5.01, 0.1),
+  metrics = c("auc"),
+  cause = primary_event
+)
+
+# AUCs for SCREAM and UKB data
+AUC_rdata_SCREAM_mm <- Score(
+  list("csh_development" = fit_csh),
+  formula = Hist(time, event) ~ 1,
+  cens.model = "km",
+  data = rdata_mm,
+  conf.int = TRUE,
+  times = seq(0.4, 5.1, 0.2),
+  metrics = c("auc"),
+  cause = primary_event
+)
+
+AUC_rdata_SCREAM_nomm <- Score(
+  list("csh_development" = fit_csh),
+  formula = Hist(time, event) ~ 1,
+  cens.model = "km",
+  data = rdata_nomm,
+  conf.int = TRUE,
+  times = seq(0.4, 5.1, 0.2),
+  metrics = c("auc"),
+  cause = primary_event
+)
+
+AUC_vdata_UKB_mm <- Score(
+  list("csh_validation" = fit_csh),
+  formula = Hist(time, event) ~ 1,
+  cens.model = "km",
+  data = vdata_mm,
+  conf.int = TRUE,
+  times = seq(0.5, 5.01, 0.1),
+  metrics = c("auc"),
+  cause = primary_event
+)
+
+AUC_vdata_UKB_nomm <- Score(
+  list("csh_validation" = fit_csh),
+  formula = Hist(time, event) ~ 1,
+  cens.model = "km",
+  data = vdata_nomm,
+  conf.int = TRUE,
+  times = seq(0.5, 5.01, 0.1),
+  metrics = c("auc"),
+  cause = primary_event
+)
+
+# Plot
+par(las = 1, xaxs = "i", yaxs = "i")
+oldpar <- par(mfrow = c(1, 2))
+plot(AUC_rdata$times,
+  AUC_rdata$AUC$score$AUC,
+  type = "l",
+  bty = "n",
+  xlim = c(0, 5),
+  ylim = c(.5, 1),
+  lwd = 2,
+  xlab = "Time (years)",
+  ylab = "AUC",
+  lty = 1
+)
+polygon(c(
+  AUC_rdata$times,
+  rev(AUC_rdata$times)
+),
+c(
+  AUC_rdata$AUC$score$lower,
+  rev(AUC_rdata$AUC$score$upper)
+),
+col = rgb(160, 160, 160, maxColorValue = 255, alpha = 100),
+border = FALSE
+)
+lines(AUC_rdata$times,
+  AUC_rdata$AUC$score$AUC,
+  col = "black",
+  lwd = 2,
+  lty = 2
+)
+title("Development data", adj = 0)
+
+# Validation data
+plot(AUC_vdata$times,
+  AUC_vdata$AUC$score$AUC,
+  type = "l",
+  bty = "n",
+  xlim = c(0, 5),
+  ylim = c(.5, 1),
+  lwd = 2,
+  xlab = "Time (years)",
+  ylab = "AUC",
+  lty = 1
+)
+polygon(c(
+  AUC_vdata$times,
+  rev(AUC_vdata$times)
+),
+c(
+  AUC_vdata$AUC$score$lower,
+  rev(AUC_vdata$AUC$score$upper)
+),
+col = rgb(160, 160, 160, maxColorValue = 255, alpha = 100),
+border = FALSE
+)
+lines(AUC_vdata$times,
+  AUC_vdata$AUC$score$AUC,
+  col = "black",
+  lwd = 2,
+  lty = 2
+)
+title("Validation data", adj = 0)
+
+# SCREAM mm vs nomm data
+plot(AUC_rdata_SCREAM_mm$times,
+  AUC_rdata_SCREAM_mm$AUC$score$AUC,
+  type = "l",
+  bty = "n",
+  xlim = c(0, 5),
+  ylim = c(.5, 1),
+  lwd = 2,
+  xlab = "Time (years)",
+  ylab = "AUC",
+  lty = 1
+)
+polygon(c(
+  AUC_rdata_SCREAM_mm$times,
+  rev(AUC_rdata_SCREAM_mm$times)
+),
+c(
+  AUC_rdata_SCREAM_mm$AUC$score$lower,
+  rev(AUC_rdata_SCREAM_mm$AUC$score$upper)
+),
+col = rgb(160, 160, 160, maxColorValue = 255, alpha = 100),
+border = FALSE
+)
+lines(AUC_rdata_SCREAM_mm$times,
+  AUC_rdata_SCREAM_mm$AUC$score$AUC,
+  col = "black",
+  lwd = 2,
+  lty = 2
+)
+title("SCREAM multimorbidity cohort", adj = 0)
+
+plot(AUC_rdata_SCREAM_nomm$times,
+  AUC_rdata_SCREAM_nomm$AUC$score$AUC,
+  type = "l",
+  bty = "n",
+  xlim = c(0, 5),
+  ylim = c(.5, 1),
+  lwd = 2,
+  xlab = "Time (years)",
+  ylab = "AUC",
+  lty = 1
+)
+polygon(c(
+  AUC_rdata_SCREAM_nomm$times,
+  rev(AUC_rdata_SCREAM_nomm$times)
+),
+c(
+  AUC_rdata_SCREAM_nomm$AUC$score$lower,
+  rev(AUC_rdata_SCREAM_nomm$AUC$score$upper)
+),
+col = rgb(160, 160, 160, maxColorValue = 255, alpha = 100),
+border = FALSE
+)
+lines(AUC_rdata_SCREAM_nomm$times,
+  AUC_rdata_SCREAM_nomm$AUC$score$AUC,
+  col = "black",
+  lwd = 2,
+  lty = 2
+)
+title("SCREAM no multimorbidity cohort", adj = 0)
+
+# UKB mm vs nomm data
+plot(AUC_vdata_UKB_mm$times,
+  AUC_vdata_UKB_mm$AUC$score$AUC,
+  type = "l",
+  bty = "n",
+  xlim = c(0, 5),
+  ylim = c(.5, 1),
+  lwd = 2,
+  xlab = "Time (years)",
+  ylab = "AUC",
+  lty = 1
+)
+polygon(c(
+  AUC_vdata_UKB_mm$times,
+  rev(AUC_vdata_UKB_mm$times)
+),
+c(
+  AUC_vdata_UKB_mm$AUC$score$lower,
+  rev(AUC_vdata_UKB_mm$AUC$score$upper)
+),
+col = rgb(160, 160, 160, maxColorValue = 255, alpha = 100),
+border = FALSE
+)
+lines(AUC_vdata_UKB_mm$times,
+  AUC_vdata_UKB_mm$AUC$score$AUC,
+  col = "black",
+  lwd = 2,
+  lty = 2
+)
+title("UKB multimorbidity cohort", adj = 0)
+
+plot(AUC_vdata_UKB_nomm$times,
+  AUC_vdata_UKB_nomm$AUC$score$AUC,
+  type = "l",
+  bty = "n",
+  xlim = c(0, 5),
+  ylim = c(.5, 1),
+  lwd = 2,
+  xlab = "Time (years)",
+  ylab = "AUC",
+  lty = 1
+)
+polygon(c(
+  AUC_vdata_UKB_nomm$times,
+  rev(AUC_vdata_UKB_nomm$times)
+),
+c(
+  AUC_vdata_UKB_nomm$AUC$score$lower,
+  rev(AUC_vdata_UKB_nomm$AUC$score$upper)
+),
+col = rgb(160, 160, 160, maxColorValue = 255, alpha = 100),
+border = FALSE
+)
+lines(AUC_vdata_UKB_nomm$times,
+  AUC_vdata_UKB_nomm$AUC$score$AUC,
+  col = "black",
+  lwd = 2,
+  lty = 2
+)
+title("UKB no multimorbidity cohort", adj = 0)
+```
+</details>
+
+```{r, plot_AUCs, warning=FALSE,echo=FALSE, eval=TRUE}
+```
+
+
+
+### 2.3 Overall prediction error
+
+We calculate the Brier Score, and the scaled Brier scale (also indicated by scaled Brier score or IPA) and the corresponding confidence intervals.
+
+Some confidence intervals are calculated using the bootstrap percentile method.
+```{r, bootstrap,warning=FALSE}
+# Bootstrapping data
+set.seed(20201214)
+B <- 500 # number of bootstrap samples
+rboot <- bootstraps(rdata, times = B)
+vboot <- bootstraps(vdata, times = B)
+rboot_SCREAM_mm <- bootstraps(rdata_mm, times = B) 
+rboot_SCREAM_nomm <- bootstraps(rdata_nomm, times = B) 
+vboot_UKB_mm <- bootstraps(vdata_mm, times = B)
+vboot_UKB_nomm <- bootstraps(vdata_nomm, times = B)
+
+```
+
+<details>
+  <summary>Click to expand code</summary>
+```{r, overall, warning=FALSE,  fig.align='center', message=FALSE, echo=TRUE}
+
+# Models -------------------
+fit_csh <- CSC(Hist(time, event) ~
+age + sexnumber + egfrcr09_race_allnonblack + lnacr2,
+data = rdata,
+fitter = "cph"
+)
+fit_csc1 <- fit_csh$models$`Cause 1`
+fit_csc2 <- fit_csh$models$`Cause 2`
+
+# Overall performance measures ----------------
+primary_event <- 1 # Set to 2 if cause 2 was of interest
+horizon <- 5 # Set time horizon for prediction (here 5 years)
+
+# Development data
+score_rdata <- Score(
+  list("csh_development" = fit_csh),
+  formula = Hist(time, event) ~ 1,
+  cens.model = "km",
+  data = rdata,
+  conf.int = TRUE,
+  times = horizon,
+  metrics = c("auc", "brier"),
+  summary = c("ipa"),
+  cause = primary_event,
+  plots = "calibration"
+)
+
+# Validation data
+score_vdata <- Score(
+  list("csh_validation" = fit_csh),
+  formula = Hist(time, event) ~ 1,
+  cens.model = "km",
+  data = vdata,
+  conf.int = TRUE,
+  times = horizon,
+  metrics = c("auc", "brier"),
+  summary = c("ipa"),
+  cause = primary_event,
+  plots = "calibration"
+)
+
+# SCREAM multimorbidity
+score_rdata_SCREAM_mm <- Score(
+  list("csh_validation" = fit_csh),
+  formula = Hist(time, event) ~ 1,
+  cens.model = "km",
+  data = rdata_mm,
+  conf.int = TRUE,
+  times = horizon,
+  metrics = c("auc", "brier"),
+  summary = c("ipa"),
+  cause = primary_event,
+  plots = "calibration"
+)
+
+# SCREAM no multimorbidity
+score_rdata_SCREAM_nomm <- Score(
+  list("csh_validation" = fit_csh),
+  formula = Hist(time, event) ~ 1,
+  cens.model = "km",
+  data = rdata_nomm,
+  conf.int = TRUE,
+  times = horizon,
+  metrics = c("auc", "brier"),
+  summary = c("ipa"),
+  cause = primary_event,
+  plots = "calibration"
+)
+
+# UKB multimorbidity
+score_vdata_UKB_mm <- Score(
+  list("csh_validation" = fit_csh),
+  formula = Hist(time, event) ~ 1,
+  cens.model = "km",
+  data = vdata_mm,
+  conf.int = TRUE,
+  times = horizon,
+  metrics = c("auc", "brier"),
+  summary = c("ipa"),
+  cause = primary_event,
+  plots = "calibration"
+)
+
+# UKB no multimorbidity
+score_vdata_UKB_nomm <- Score(
+  list("csh_validation" = fit_csh),
+  formula = Hist(time, event) ~ 1,
+  cens.model = "km",
+  data = vdata_nomm,
+  conf.int = TRUE,
+  times = horizon,
+  metrics = c("auc", "brier"),
+  summary = c("ipa"),
+  cause = primary_event,
+  plots = "calibration"
+)
+
+
+# Bootstrap ------
+# Functions to expand data and calculate Brier, IPA and AUC in bootstrap
+# samples.
+# For Brier and AUC, bootstrap should be computationally faster when
+# data has more than 2000 rows (see ?riskRegression::Score).
+# Our data has 1000 row so we will need only bootstrap to calculate
+# confidence intervals of the scaled Brier (IPA) since
+# it is not provided by riskRegression::Score() function.
+
+
+# Score functions in any bootstrap data
+score_boot <- function(split) {
+  Score(
+    list("csh_validation" = fit_csh),
+    formula = Hist(time, event) ~ 1,
+    cens.model = "km",
+    data = analysis(split),
+    conf.int = TRUE,
+    times = horizon,
+    metrics = c("auc", "brier"),
+    summary = c("ipa"),
+    cause = primary_event,
+    plots = "calibration"
+  )
+}
+
+# Development data
+rboot <- rboot |> mutate(
+  score = map(splits, score_boot),
+  scaled_brier = map_dbl(score, function(x) {
+    x$Brier$score[model == "csh_validation"]$IPA
+  })
+)
+# Validation data
+vboot <- vboot |> mutate(
+  score = map(splits, score_boot),
+  scaled_brier = map_dbl(score, function(x) {
+    x$Brier$score[model == "csh_validation"]$IPA
+  })
+)
+# SCREAM mm
+rboot_SCREAM_mm <- rboot_SCREAM_mm |> mutate(
+  score = map(splits, score_boot),
+  scaled_brier = map_dbl(score, function(x) {
+    x$Brier$score[model == "csh_validation"]$IPA
+  })
+)
+# SCREAM no mm
+rboot_SCREAM_nomm <- rboot_SCREAM_nomm |> mutate(
+  score = map(splits, score_boot),
+  scaled_brier = map_dbl(score, function(x) {
+    x$Brier$score[model == "csh_validation"]$IPA
+  })
+)
+# UKB mm
+vboot_UKB_mm <- vboot_UKB_mm |> mutate(
+  score = map(splits, score_boot),
+  scaled_brier = map_dbl(score, function(x) {
+    x$Brier$score[model == "csh_validation"]$IPA
+  })
+)
+# UKB no mm
+vboot_UKB_nomm <- vboot_UKB_nomm |> mutate(
+  score = map(splits, score_boot),
+  scaled_brier = map_dbl(score, function(x) {
+    x$Brier$score[model == "csh_validation"]$IPA
+  })
+)
+```
+</details>
+
+```{r, overall, warning=FALSE,echo=FALSE, eval=TRUE}
+```
+
+```{r, res_ov, fig.align='center',echo=FALSE}
+# Table overall measures
+alpha <- .05
+k <- 2 # number of digits
+res_ov_csh <- matrix(unlist(c(
+  # Brier score - apparent validation
+  score_rdata$Brier$score[model == "csh_development"]$Brier,
+  score_rdata$Brier$score[model == "csh_development"]$lower,
+  score_rdata$Brier$score[model == "csh_development"]$upper,
+
+  # Brier score - external validation
+  score_vdata$Brier$score[model == "csh_validation"]$Brier,
+  score_vdata$Brier$score[model == "csh_validation"]$lower,
+  score_vdata$Brier$score[model == "csh_validation"]$upper,
+  
+  # Brier score - SCREAM mm
+  score_rdata_SCREAM_mm$Brier$score[model == "csh_validation"]$Brier,
+  score_rdata_SCREAM_mm$Brier$score[model == "csh_validation"]$lower,
+  score_rdata_SCREAM_mm$Brier$score[model == "csh_validation"]$upper,
+ 
+  # Brier score - SCREAM no mm
+  score_rdata_SCREAM_nomm$Brier$score[model == "csh_validation"]$Brier,
+  score_rdata_SCREAM_nomm$Brier$score[model == "csh_validation"]$lower,
+  score_rdata_SCREAM_nomm$Brier$score[model == "csh_validation"]$upper,
+   
+  # Brier score - UKB mm
+  score_vdata_UKB_mm$Brier$score[model == "csh_validation"]$Brier,
+  score_vdata_UKB_mm$Brier$score[model == "csh_validation"]$lower,
+  score_vdata_UKB_mm$Brier$score[model == "csh_validation"]$upper,
+  
+  # Brier score - UKB no mm
+  score_vdata_UKB_nomm$Brier$score[model == "csh_validation"]$Brier,
+  score_vdata_UKB_nomm$Brier$score[model == "csh_validation"]$lower,
+  score_vdata_UKB_nomm$Brier$score[model == "csh_validation"]$upper,
+
+  # IPA - apparent validation
+  score_rdata$Brier$score[model == "csh_development"]$IPA,
+  quantile(rboot$scaled_brier, probs = alpha / 2),
+  quantile(rboot$scaled_brier, probs = 1 - alpha / 2),
+
+  # IPA - external validation
+  score_vdata$Brier$score[model == "csh_validation"]$IPA,
+  quantile(vboot$scaled_brier, probs = alpha / 2),
+  quantile(vboot$scaled_brier, probs = 1 - alpha / 2),
+  
+   # IPA - SCREAM mm
+  score_rdata_SCREAM_mm$Brier$score[model == "csh_validation"]$IPA,
+  quantile(rboot_SCREAM_mm$scaled_brier, probs = alpha / 2),
+  quantile(rboot_SCREAM_mm$scaled_brier, probs = 1 - alpha / 2),
+  
+  # IPA - SCREAM no mm
+  score_rdata_SCREAM_nomm$Brier$score[model == "csh_validation"]$IPA,
+  quantile(rboot_SCREAM_nomm$scaled_brier, probs = alpha / 2),
+  quantile(rboot_SCREAM_nomm$scaled_brier, probs = 1 - alpha / 2),
+  
+   # IPA - UKB mm
+  score_vdata_UKB_mm$Brier$score[model == "csh_validation"]$IPA,
+  quantile(vboot_UKB_mm$scaled_brier, probs = alpha / 2),
+  quantile(vboot_UKB_mm$scaled_brier, probs = 1 - alpha / 2),
+  
+  # IPA - UKB no mm
+  score_vdata_UKB_nomm$Brier$score[model == "csh_validation"]$IPA,
+  quantile(vboot_UKB_nomm$scaled_brier, probs = alpha / 2),
+  quantile(vboot_UKB_nomm$scaled_brier, probs = 1 - alpha / 2)
+)),
+nrow = 2, ncol = 18,
+byrow = T,
+dimnames =
+  list(
+    c("Brier", "scaled Brier"),
+    rep(c("Estimate", "Lower .95 ", "Upper .95"),6)
+  )
+)
+
+
+
+kable(res_ov_csh) |>
+  kable_styling("striped", position = "center")  |>
+  add_header_above(c(
+    " " = 1,
+    "Development data" = 3,
+    "Validation data" = 3,
+    "SCREAM multimorbidity" = 3,
+    "SCREAM no multimorbidity" = 3,
+    "UKB multimorbidity" = 3,
+    "UKB no multimorbidity" = 3
+  ))
+```
+
+```{r details for reporting full model formula}
+model_info2 <- list(
+  "coefficients" = stats::coef(fit_csh),
+  "baseline_hazards" = lapply(fit_csh$models, function(mod) survival::basehaz(mod, centered = FALSE)),
+  "model_terms" = lapply(fit_csh$models, function(mod) mod[["terms"]])
+)
+
+model_info2 
+
+# Can be saved to then be shared as:
+saveRDS(model_info2, file = "model_info2.rds")
+```
+
+##Compare original KFRE risk referral thresholds with competing risk referral thresholds
+
+```{r}
+# Re-import data ------------------
+load(file="~/R working directory/SCREAM/linear_predictor.RData")
+SCREAM_plus_CSCrisk <- linear_predictor
+UKB_plus_CSCrisk <- readRDS("~/R working directory/UKB/new_ukb.rds")
+
+UKB_plus_CSCrisk <- UKB_plus_CSCrisk %>% mutate(cardio_mm = ifelse(card_met_mmcount_cat==0|card_met_mmcount_cat==1, 0, 1))
+
+UKB_plus_CSCrisk$event <- ifelse(UKB_plus_CSCrisk$death==1, 2, 0)
+UKB_plus_CSCrisk$event <- ifelse(UKB_plus_CSCrisk$outcome==1, 1, UKB_plus_CSCrisk$event)
+UKB_plus_CSCrisk = UKB_plus_CSCrisk %>% 
+  mutate(time = (futime_months/12)) %>% 
+  mutate(status= case_when(
+    event==2 ~ "death",
+    event==1 ~"KF",
+    event==0 ~ "cens")) %>% 
+  mutate(acr2 = ifelse(acr2 == 0, 0.00001, acr2)) %>% 
+  mutate(lnacr2 = (log(acr2)))
+
+SCREAM_plus_CSCrisk$event <- ifelse(SCREAM_plus_CSCrisk$death==1, 2, 0)
+SCREAM_plus_CSCrisk$event <- ifelse(SCREAM_plus_CSCrisk$outcome==1, 1, SCREAM_plus_CSCrisk$event)
+SCREAM_plus_CSCrisk = SCREAM_plus_CSCrisk %>% 
+  mutate(time = (futime_months/12)) %>% 
+  mutate(status= case_when(
+    event==2 ~ "death",
+    event==1 ~"KF",
+    event==0 ~ "cens")) %>% 
+  mutate(acr2 = ifelse(acr2 == 0, 0.00001, acr2)) %>% 
+  mutate(lnacr2 = (log(acr2)))
+
+UKB_plus_CSCrisk <- UKB_plus_CSCrisk %>%
+  mutate(status = factor(case_when(
+    event == 2 ~ "death",
+    event == 1 ~ "KF",
+    event == 0 ~ "cens"
+  ), levels = c("death", "KF", "cens")))
+
+SCREAM_plus_CSCrisk <- SCREAM_plus_CSCrisk %>%
+  mutate(status = factor(case_when(
+    event == 2 ~ "death",
+    event == 1 ~ "KF",
+    event == 0 ~ "cens"
+  ), levels = c("death", "KF", "cens")))
+
+SCREAM_plus_CSCrisk <- SCREAM_plus_CSCrisk %>%
+  mutate(sex = factor(case_when(
+    female == 0 ~ "female",
+    female == 1 ~ "male"
+  ), levels = c("female", "male")))
+
+
+UKB_plus_CSCrisk <- UKB_plus_CSCrisk %>%
+  mutate(sex = factor(case_when(
+    sexnumber == 0 ~ "female",
+    sexnumber == 1 ~ "male"
+  ), levels = c("female", "male")))
+
+SCREAM_plus_CSCrisk <- SCREAM_plus_CSCrisk %>% 
+  rename_at('lopnr', ~'eid') %>% 
+  rename_at('sex', ~'sexnumber')
+UKB_plus_CSCrisk <- UKB_plus_CSCrisk %>% 
+  select(-sexnumber) %>% 
+  rename_at('sex', ~'sexnumber')
+
+UKB_plus_CSCrisk_mm <- subset(UKB_plus_CSCrisk, UKB_plus_CSCrisk$mmcount_nockd >1)
+UKB_plus_CSCrisk_nomm <- subset(UKB_plus_CSCrisk, UKB_plus_CSCrisk$mmcount_nockd<=1)
+SCREAM_plus_CSCrisk_mm <- subset(SCREAM_plus_CSCrisk, SCREAM_plus_CSCrisk$mmcount_nockd >1)
+SCREAM_plus_CSCrisk_nomm <- subset(SCREAM_plus_CSCrisk, SCREAM_plus_CSCrisk$mmcount_nockd<=1)
+
+
+# Calculate predicted probabilities
+SCREAM_plus_CSCrisk$pred <- predictRisk(
+  fit_csh,
+  cause = 1,
+  newdata = SCREAM_plus_CSCrisk,
+  times = horizon
+)
+
+UKB_plus_CSCrisk$pred <- predictRisk(
+  fit_csh,
+  cause = 1,
+  newdata = UKB_plus_CSCrisk,
+  times = horizon
+)
+
+#make age categories
+SCREAM_plus_CSCrisk <- SCREAM_plus_CSCrisk %>% 
+  mutate(age_cat = cut(age, 
+      breaks = c(18, 44.9, 64.9, 74.9, 107), 
+      include.lowest = TRUE)) %>%
+  mutate(age_cat = fct_recode(age_cat,
+      "18to44" = "[18,44.9]",
+      "45to64" = "(44.9,64.9]",
+      "65to74" = "(64.9,74.9]",
+      "75plus" = "(74.9,107]"))
+
+UKB_plus_CSCrisk <- UKB_plus_CSCrisk %>% 
+  mutate(age_cat = cut(age, 
+      breaks = c(18, 44.9, 64.9, 74.9), 
+      include.lowest = TRUE)) %>%
+  mutate(age_cat = fct_recode(age_cat,
+      "18to44" = "[18,44.9]",
+      "45to64" = "(44.9,64.9]",
+      "65to74" = "(64.9,74.9]"))
+
+UKB_plus_CSCrisk <- UKB_plus_CSCrisk %>% 
+  mutate(mmcount_nockd_cat = fct_recode(mmcount_nockd_cat,
+                                        "0" = "[0,0.9]",
+                                        "1" = "(0.9,1.9]",
+                                        "2" = "(1.9,2.9]",
+                                        "3" = "(2.9,3.9]",
+                                        "4" = "(3.9,4.9]",
+                                        "5 or more" = "(4.9,13]"))
+
+#Create risk groups for competing risk model (pred)
+cutoffs <- c(-Inf, 0.03, 0.05, 0.15, 0.25, 0.50, Inf)
+
+SCREAM_plus_CSCrisk <- SCREAM_plus_CSCrisk %>% 
+  mutate(risk_group_CSC = cut(pred, breaks = cutoffs, 
+                                  include.lowest = TRUE,
+                                  labels = c("<3%", "3-<5%", "5-<15%", "15-<25%", "25-<50%", ">=50%")))
+
+
+UKB_plus_CSCrisk <- UKB_plus_CSCrisk %>% 
+  mutate(risk_group_CSC = cut(pred, breaks = cutoffs, 
+                                  include.lowest = TRUE,
+                                  labels = c("<3%", "3-<5%", "5-<15%", "15-<25%", "25-<50%", ">=50%")))
+
+
+UKB_KFRE_GT3 <- subset(UKB_plus_CSCrisk, UKB_plus_CSCrisk$KFRE_egfrcr09_race_allnonblack1>=0.03)
+UKB_KFRE_GT5 <- subset(UKB_plus_CSCrisk, UKB_plus_CSCrisk$KFRE_egfrcr09_race_allnonblack1>=0.05)
+UKB_CSC_GT3 <- subset(UKB_plus_CSCrisk, UKB_plus_CSCrisk$pred>=0.03)
+UKB_CSC_GT5 <- subset(UKB_plus_CSCrisk, UKB_plus_CSCrisk$pred>=0.05)
+SCREAM_KFRE_GT3 <- subset(SCREAM_plus_CSCrisk, SCREAM_plus_CSCrisk$KFRE_egfrcr09_race_allnonblack1>=0.03)
+SCREAM_KFRE_GT5 <- subset(SCREAM_plus_CSCrisk, SCREAM_plus_CSCrisk$KFRE_egfrcr09_race_allnonblack1>=0.05)
+SCREAM_CSC_GT3 <- subset(SCREAM_plus_CSCrisk, SCREAM_plus_CSCrisk$pred>=0.03)
+SCREAM_CSC_GT5 <- subset(SCREAM_plus_CSCrisk, SCREAM_plus_CSCrisk$pred>=0.05)
+
+
+```
+
+### Descriptive statistics
+
+```{r, import}
+SCREAM_KFRE_GT5 <- SCREAM_KFRE_GT5[, c("eid", "age", "sexnumber", "egfrcr09_race_allnonblack", "lnacr2", "acr2", "age_cat", "mmcount_nockd_cat", "cardio_mm", "mixedLTC", "complexLTC", "outcome_5yrs", "death_5yrs")]
+SCREAM_CSC_GT5 <- SCREAM_CSC_GT5[, c("eid", "age", "sexnumber", "egfrcr09_race_allnonblack", "lnacr2", "acr2", "age_cat", "mmcount_nockd_cat", "cardio_mm", "mixedLTC", "complexLTC", "outcome_5yrs", "death_5yrs")]
+UKB_KFRE_GT5 <- UKB_KFRE_GT5[, c("eid", "age", "sexnumber", "egfrcr09_race_allnonblack", "lnacr2", "acr2", "age_cat", "mmcount_nockd_cat", "cardio_mm", "mixedLTC", "complexLTC", "outcome_5yrs", "death_5yrs")]
+UKB_CSC_GT5 <- UKB_CSC_GT5[, c("eid", "age", "sexnumber", "egfrcr09_race_allnonblack", "lnacr2", "acr2", "age_cat", "mmcount_nockd_cat", "cardio_mm", "mixedLTC", "complexLTC", "outcome_5yrs", "death_5yrs")]
+
+SCREAM_KFRE_GT3 <- SCREAM_KFRE_GT3[, c("eid", "age", "sexnumber", "egfrcr09_race_allnonblack", "lnacr2", "acr2", "age_cat", "mmcount_nockd_cat", "cardio_mm", "mixedLTC", "complexLTC", "outcome_5yrs", "death_5yrs")]
+SCREAM_CSC_GT3 <- SCREAM_CSC_GT3[, c("eid", "age", "sexnumber", "egfrcr09_race_allnonblack", "lnacr2", "acr2", "age_cat", "mmcount_nockd_cat", "cardio_mm", "mixedLTC", "complexLTC", "outcome_5yrs", "death_5yrs")]
+UKB_KFRE_GT3 <- UKB_KFRE_GT3[, c("eid", "age", "sexnumber", "egfrcr09_race_allnonblack", "lnacr2", "acr2", "age_cat", "mmcount_nockd_cat", "cardio_mm", "mixedLTC", "complexLTC", "outcome_5yrs", "death_5yrs")]
+UKB_CSC_GT3 <- UKB_CSC_GT3[, c("eid", "age", "sexnumber", "egfrcr09_race_allnonblack", "lnacr2", "acr2", "age_cat", "mmcount_nockd_cat", "cardio_mm", "mixedLTC", "complexLTC", "outcome_5yrs", "death_5yrs")]
+
+
+
+UKB_KFRE_GT5$dt <- 1
+UKB_CSC_GT5$dt <- 2
+SCREAM_KFRE_GT5$dt <- 3
+SCREAM_CSC_GT5$dt <- 4
+cdata <- rbind(UKB_KFRE_GT5, UKB_CSC_GT5, SCREAM_KFRE_GT5, SCREAM_CSC_GT5)
+cdata$dt <- factor(
+  cdata$dt,
+  levels = c(1, 2, 3, 4),
+  labels = c("UK Biobank KFRE", "UK Bioank Competing Risk model", "SCREAM KFRE", "SCREAM Competing Risk model")
+)
+label(cdata$age) <- "Age"
+label(cdata$sexnumber) <- "Sex"
+label(cdata$egfrcr09_race_allnonblack) <- "eGFR creatinine"
+label(cdata$acr2) <- "uACR"
+units(cdata$age) <- "years"
+units(cdata$egfrcr09_race_allnonblack) <- "ml/min/1.73m2"
+units(cdata$acr2) <- "mg/mmol"
+```
+
+
+```{r tab1_bis}
+gtsummary::tbl_summary(
+  data = cdata |> select(-eid),
+  label = list(age ~ "Age (years)", egfrcr09_race_allnonblack ~ "eGFR creatinine (ml/min/1.73m2)", acr2 ~"uACR (mg/mmol)"),
+  by = "dt",
+  type = all_continuous() ~ "continuous2",
+  statistic = all_continuous() ~ c(
+    "{mean} ({sd})",
+    "{median} ({min}, {max})"
+  ),
+) |>
+  gtsummary::as_kable_extra() |>
+  kableExtra::kable_styling("striped")
+```
+
+
+
+  
